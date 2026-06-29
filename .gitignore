@@ -1,0 +1,10 @@
+.DS_Store
+.idea/
+__pycache__/
+*.py[cod]
+*.log
+.env
+src/logs/
+src/resources/temp/
+src/resources/output/
+upload_images/
