@@ -8,3 +8,10 @@ src/logs/
 src/resources/temp/
 src/resources/output/
 upload_images/
+DIGITALSYSTEM-ERREN/
+build/
+dist/
+dist_nuitka/
+*.build/
+*.dist/
+*.onefile-build/

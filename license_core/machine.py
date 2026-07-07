@@ -1,21 +1,22 @@
-# -*-coding  : utf-8 -*-
-# @Author    : zhangtao
-# @File      : machine.py
-# @Desc      : 
-# @Time      : 2026/7/5 15:44
-# @Software  : PyCharm
-
+# -*- coding: utf-8 -*-
 import hashlib
+import os
 import platform
+import re
 import subprocess
 import sys
 import uuid
-from typing import List, Dict
+from pathlib import Path
+from typing import Dict, List
 
+try:
+    from license_core.config import PRODUCT_NAME, PRODUCT_SALT
+except ModuleNotFoundError:
+    from config import PRODUCT_NAME, PRODUCT_SALT
 
-# 软件唯一标识
-PRODUCT_SALT = "DigitalSystem-2026-License"
-
+FALLBACK_MACHINE_CODE = "WINDOWS-RUNTIME-MACHINE-CODE-UNAVAILABLE"
+MACHINE_CODE_CACHE_FILENAME = "machine_code.txt"
+MACHINE_CODE_PATTERN = re.compile(r"^[0-9A-F]{8}(-[0-9A-F]{8}){7}$")
 
 INVALID_VALUES = {
     "",
@@ -26,7 +27,6 @@ INVALID_VALUES = {
     "N/A",
     "NOTAVAILABLE",
     "NOTAPPLICABLE",
-
     "SYSTEMSERIALNUMBER",
     "TBR",
     "TOBEFILLEDBYO.E.M.",
@@ -36,7 +36,6 @@ INVALID_VALUES = {
     "DEFAULT",
     "OEM",
     "OEMSTRING",
-
     "00000000",
     "0000000000000000",
     "FFFFFFFF",
@@ -45,13 +44,9 @@ INVALID_VALUES = {
 
 
 def run_cmd(command: str) -> str:
-    """
-    执行系统命令。
-    打包成 Windows exe 后，不弹出黑窗口。
-    """
+    """Run a hardware query command without opening a console on Windows."""
     try:
         creationflags = 0
-
         if sys.platform.startswith("win"):
             creationflags = subprocess.CREATE_NO_WINDOW
 
@@ -65,18 +60,12 @@ def run_cmd(command: str) -> str:
             encoding="utf-8",
             errors="ignore",
         )
-
         return output.strip()
-
     except Exception:
         return ""
 
 
 def normalize(value: str) -> str:
-    """
-    统一格式，避免大小写、空格、换行影响机器码。
-    同时过滤无效硬件值。
-    """
     if not value:
         return ""
 
@@ -86,154 +75,103 @@ def normalize(value: str) -> str:
     value = value.replace("\t", "")
     value = value.replace(" ", "")
     value = value.upper()
+    compact_value = value.replace("-", "").replace("{", "").replace("}", "")
 
-    if value in INVALID_VALUES:
+    if value in INVALID_VALUES or compact_value in INVALID_VALUES:
+        return ""
+    if compact_value and set(compact_value) in ({"0"}, {"F"}):
         return ""
 
     return value
 
 
 def clean_lines(text: str, title: str = "") -> List[str]:
-    """
-    清理 wmic / powershell 输出。
-    """
     result = []
 
     for line in text.splitlines():
         line = normalize(line)
-
         if not line:
             continue
-
         if title and line == normalize(title):
             continue
-
         if line in INVALID_VALUES:
             continue
-
         result.append(line)
 
-    # 去重、排序，避免多硬盘顺序变化导致机器码变化
     return sorted(set(result))
 
 
 def get_wmic_value(command: str, title: str) -> str:
-    """
-    通过 wmic 获取硬件信息。
-    """
     text = run_cmd(command)
     lines = clean_lines(text, title)
-
     return "|".join(lines)
 
 
 def get_powershell_value(command: str) -> str:
-    """
-    通过 PowerShell 获取硬件信息，作为 wmic 的补充。
-    """
     ps_command = f'powershell -NoProfile -ExecutionPolicy Bypass -Command "{command}"'
     text = run_cmd(ps_command)
     lines = clean_lines(text)
-
     return "|".join(lines)
 
 
 def get_cpu_id() -> str:
-    """
-    CPU ID
-    """
-    value = get_wmic_value(
-        "wmic cpu get ProcessorId",
-        "ProcessorId"
-    )
-
+    value = get_wmic_value("wmic cpu get ProcessorId", "ProcessorId")
     if value:
         return value
+    return get_powershell_value("(Get-CimInstance Win32_Processor).ProcessorId")
 
-    return get_powershell_value(
-        "(Get-CimInstance Win32_Processor).ProcessorId"
-    )
+
+def get_windows_machine_guid() -> str:
+    if not sys.platform.startswith("win"):
+        return ""
+
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+        return normalize(str(value))
+    except Exception:
+        return ""
 
 
 def get_baseboard_serial() -> str:
-    """
-    主板序列号
-    """
-    value = get_wmic_value(
-        "wmic baseboard get SerialNumber",
-        "SerialNumber"
-    )
-
+    value = get_wmic_value("wmic baseboard get SerialNumber", "SerialNumber")
     if value:
         return value
-
-    return get_powershell_value(
-        "(Get-CimInstance Win32_BaseBoard).SerialNumber"
-    )
+    return get_powershell_value("(Get-CimInstance Win32_BaseBoard).SerialNumber")
 
 
 def get_bios_serial() -> str:
-    """
-    BIOS 序列号
-    """
-    value = get_wmic_value(
-        "wmic bios get SerialNumber",
-        "SerialNumber"
-    )
-
+    value = get_wmic_value("wmic bios get SerialNumber", "SerialNumber")
     if value:
         return value
-
-    return get_powershell_value(
-        "(Get-CimInstance Win32_BIOS).SerialNumber"
-    )
+    return get_powershell_value("(Get-CimInstance Win32_BIOS).SerialNumber")
 
 
 def get_disk_serial() -> str:
-    """
-    硬盘序列号。
-    """
-    value = get_wmic_value(
-        "wmic diskdrive get SerialNumber",
-        "SerialNumber"
-    )
-
+    value = get_wmic_value("wmic diskdrive get SerialNumber", "SerialNumber")
     if value:
         return value
-
-    return get_powershell_value(
-        "(Get-CimInstance Win32_DiskDrive).SerialNumber"
-    )
+    return get_powershell_value("(Get-CimInstance Win32_DiskDrive).SerialNumber")
 
 
 def get_windows_uuid() -> str:
-    """
-    Windows 设备 UUID
-    """
-    value = get_wmic_value(
-        "wmic csproduct get UUID",
-        "UUID"
-    )
-
+    value = get_wmic_value("wmic csproduct get UUID", "UUID")
     if value:
         return value
-
-    return get_powershell_value(
-        "(Get-CimInstance Win32_ComputerSystemProduct).UUID"
-    )
+    return get_powershell_value("(Get-CimInstance Win32_ComputerSystemProduct).UUID")
 
 
 def get_mac_address() -> str:
-    """
-    MAC 地址
-    """
     try:
         mac = uuid.getnode()
         mac_text = f"{mac:012X}"
-
         if mac_text and mac_text not in INVALID_VALUES:
             return mac_text
-
     except Exception:
         pass
 
@@ -241,11 +179,9 @@ def get_mac_address() -> str:
 
 
 def get_machine_info() -> Dict[str, str]:
-    """
-    获取原始硬件信息
-    """
-    info = {
+    return {
         "os": normalize(platform.system()),
+        "machine_guid": get_windows_machine_guid(),
         "cpu": get_cpu_id(),
         "baseboard": get_baseboard_serial(),
         "bios": get_bios_serial(),
@@ -254,52 +190,115 @@ def get_machine_info() -> Dict[str, str]:
         "mac": get_mac_address(),
     }
 
-    return info
-
 
 def format_machine_code(code: str) -> str:
-    """
-    把 64 位 SHA256 结果分段，方便复制和人工查看。
-    """
-    return "-".join([
-        code[0:8],
-        code[8:16],
-        code[16:24],
-        code[24:32],
-        code[32:40],
-        code[40:48],
-        code[48:56],
-        code[56:64],
-    ])
+    return "-".join(
+        [
+            code[0:8],
+            code[8:16],
+            code[16:24],
+            code[24:32],
+            code[32:40],
+            code[40:48],
+            code[48:56],
+            code[56:64],
+        ]
+    )
 
 
-def get_machine_code() -> str:
-    """
-    生成最终机器码。
-    """
-    info = get_machine_info()
+def is_valid_machine_code(code: str) -> bool:
+    return bool(MACHINE_CODE_PATTERN.fullmatch(str(code).strip().upper()))
 
-    raw = "|".join([
-        PRODUCT_SALT,
-        info.get("os", ""),
-        info.get("cpu", ""),
+
+def get_machine_code_cache_path() -> Path:
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        cache_dir = Path(appdata) / PRODUCT_NAME
+    else:
+        cache_dir = Path.cwd() / PRODUCT_NAME
+    return cache_dir / MACHINE_CODE_CACHE_FILENAME
+
+
+def read_cached_machine_code() -> str:
+    try:
+        cache_path = get_machine_code_cache_path()
+        if not cache_path.exists():
+            return ""
+        code = cache_path.read_text(encoding="utf-8").strip().upper()
+        if is_valid_machine_code(code):
+            return code
+    except Exception:
+        pass
+    return ""
+
+
+def write_cached_machine_code(code: str) -> None:
+    if not is_valid_machine_code(code):
+        return
+
+    try:
+        cache_path = get_machine_code_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(f"{code}\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def build_machine_code(info: Dict[str, str]) -> str:
+    stable_values = [
+        info.get("machine_guid", ""),
+        info.get("windows_uuid", ""),
         info.get("baseboard", ""),
         info.get("bios", ""),
-        info.get("disk", ""),
-        info.get("windows_uuid", ""),
-        info.get("mac", ""),
-    ])
+        info.get("cpu", ""),
+    ]
 
+    raw_parts = [
+        PRODUCT_SALT,
+        info.get("os", ""),
+        *stable_values,
+    ]
+
+    if not any(stable_values):
+        raw_parts.extend(
+            [
+                info.get("disk", ""),
+                info.get("mac", ""),
+            ]
+        )
+
+    raw = "|".join(raw_parts)
     code = hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()
-
     return format_machine_code(code)
 
 
-if __name__ == "__main__":
-    print("====== 原始机器信息 ======")
+def get_machine_code() -> str:
+    """Generate the final machine code.
 
-    info = get_machine_info()
-    for key, value in info.items():
+    The first generated value is cached in the writable app data directory so
+    the registration code shown to users stays stable even if Windows returns a
+    volatile disk or network-adapter value during a later startup.
+    """
+    cached_code = read_cached_machine_code()
+    if cached_code:
+        return cached_code
+
+    try:
+        info = get_machine_info()
+        code = build_machine_code(info)
+        write_cached_machine_code(code)
+        return code
+    except Exception:
+        return FALLBACK_MACHINE_CODE
+
+
+if __name__ == "__main__":
+    print("====== 机器码缓存路径 ======")
+    print(get_machine_code_cache_path())
+    print()
+
+    print("====== 原始机器信息 ======")
+    for key, value in get_machine_info().items():
         print(f"{key}: {value}")
 
     print()

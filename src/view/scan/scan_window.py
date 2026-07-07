@@ -62,6 +62,7 @@ from src.services.scan_images_service import scan_images_service
 from src.services.scan_service import scan_service
 from src.services.task_mark_service import task_mark_service
 from src.services.task_service import task_service
+from src.utils.BlankPageDetector import BlankPageDetector
 from src.utils.ImageProcessor import ImageProcessor
 from src.utils.LoggerDetector import logger
 from src.utils.NewScannerDetector import NewScannerDetector
@@ -1112,6 +1113,13 @@ class ScanWindow(FramelessWindow):
 
         self._scan_params: dict = {}  # 当前扫描参数
         self._scan_page_count: int = 0  # 本次已扫描页数
+        self._scan_session_id: int = 0
+        self._scan_first_frame_deadline = 0.0
+        self._scan_last_transfer_error = None
+        self._scan_last_wait_log_time = 0.0
+        self._scan_stop_requested = False
+        self._scan_stop_drain_deadline = 0.0
+        self._scan_stop_drain_timeout = 30.0
         self._scan_timer = QTimer(self)  # 轮询 TWAIN 的定时器
         self._scan_timer.setInterval(100)  # 每 100ms 取一帧
         self._scan_timer.timeout.connect(self._on_scan_timer_tick)
@@ -1874,7 +1882,7 @@ class ScanWindow(FramelessWindow):
             show_error(self, "权限错误", "无法访问该文件夹，请检查权限")
         return image_paths
 
-    def load_folder_images(self, folder_path):
+    def load_folder_images(self, folder_path, force_fs=False):
         if self._thumb_loader and self._thumb_loader.isRunning():
             self._thumb_loader.cancel()
             self._thumb_loader.quit()
@@ -1888,10 +1896,14 @@ class ScanWindow(FramelessWindow):
         self.total_scanned = 0
         self.total_pages = 0
 
-        # 优先使用数据库中的 scan_images 顺序；数据库没有记录时回退读取文件夹。
-        self.img_files = self._get_db_image_paths_by_folder(folder_path)
-        if not self.img_files:
+        # 扫描完成后文件名可能刚被重排，此时必须从文件系统读取最新结果。
+        if force_fs:
             self.img_files = self._get_fs_image_paths_by_folder(folder_path)
+        else:
+            # 优先使用数据库中的 scan_images 顺序；数据库没有记录时回退读取文件夹。
+            self.img_files = self._get_db_image_paths_by_folder(folder_path)
+            if not self.img_files:
+                self.img_files = self._get_fs_image_paths_by_folder(folder_path)
 
         if not self.img_files:
             return
@@ -2087,6 +2099,10 @@ class ScanWindow(FramelessWindow):
         self._set_scan_buttons_enabled(False)
 
         p = self._scan_params
+        self._scan_session_id += 1
+        scan_session_id = self._scan_session_id
+        self._scan_timer.stop()
+        self._clear_scan_stop_request()
 
         try:
             self.scanner_manager.connect_scanner(p["scanner_device"])
@@ -2125,6 +2141,7 @@ class ScanWindow(FramelessWindow):
         # 3. 发起采集请求（在主线程调用，驱动可能弹框也没问题）
         try:
             os.makedirs(p["save_path"], exist_ok=True)
+            self._clear_scan_stop_request()
             self.scanner_manager._source.request_acquire(show_ui=False, modal_ui=False)
         except Exception as e:
             show_error(self, "扫描失败", f"发起扫描请求失败: {e}")
@@ -2136,13 +2153,21 @@ class ScanWindow(FramelessWindow):
         # 高速 ADF 扫描仪从 request_acquire 到图像就绪通常需要 3~5 秒
         # 用 QTimer.singleShot 在主线程延迟，不阻塞 UI
         self._scan_page_count = 0
+        self._scan_last_transfer_error = None
+        self._scan_last_wait_log_time = 0.0
+        self._scan_first_frame_deadline = time.time() + 15.0
         self.is_scanning = True
-        warmup_ms = 3000  # 热身等待毫秒数，如仍扫到0页可改为 4000 或70005000
+        warmup_ms = 3000
         logger.info(f"扫描请求已发出，等待扫描仪马达就绪（{warmup_ms}ms）·····")
-        QTimer.singleShot(warmup_ms, self._start_scan_polling)
+        QTimer.singleShot(
+            warmup_ms, lambda sid=scan_session_id: self._start_scan_polling(sid)
+        )
 
-    def _start_scan_polling(self):
+    def _start_scan_polling(self, session_id=None):
         """热身等待结束后，正式启动轮询 timer"""
+        if session_id is not None and session_id != self._scan_session_id:
+            logger.debug("忽略上一轮扫描遗留的热身回调")
+            return
         if not self.is_scanning:
             return  # 热身期间用户已取消
         logger.info("扫描仪马达就绪，开始轮询取帧·····")
@@ -2153,34 +2178,81 @@ class ScanWindow(FramelessWindow):
         p = self._scan_params
         _TWAIN_COUNT_UNKNOWN = 0xFFFF
 
+        if not self.scanner_manager._source:
+            self._finish_scan(
+                success=False,
+                title="扫描已停止" if self._scan_stop_requested else "扫描失败",
+                message=(
+                    "扫描仪连接已关闭，已保存当前接收到的页面"
+                    if self._scan_stop_requested
+                    else "扫描仪连接已关闭，无法继续传输图像"
+                ),
+                empty_is_error=not self._scan_stop_requested,
+            )
+            return
+
+        if (
+            self._scan_stop_requested
+            and self._scan_stop_drain_deadline > 0
+            and time.time() > self._scan_stop_drain_deadline
+        ):
+            logger.warning("停止扫描后等待缓存页传输超时，强制结束当前采集会话")
+            self._cancel_active_scan_session()
+            self._finish_scan(
+                success=False,
+                title="扫描已停止",
+                message="等待扫描仪缓存页传输超时，已保存当前接收到的页面",
+                empty_is_error=False,
+            )
+            return
+
         try:
             handle, count = self.scanner_manager._source.xfer_image_natively()
         except Exception as e:
             import twain as _twain
 
             if isinstance(e, _twain.exceptions.excTWCC_PAPERJAM):
-                logger.warning("ADF 无纸/卡纸，扫描正常结束")
+                logger.warning(f"ADF 无纸/卡纸: {e}")
+                if self._scan_page_count == 0:
+                    self._finish_scan(
+                        success=False,
+                        title="扫描未完成",
+                        message="未扫描到图像，进纸器可能无纸或卡纸",
+                    )
+                else:
+                    self._finish_scan(
+                        success=True,
+                        title="扫描完成",
+                        message="进纸器无纸或卡纸，已保存已传输页面",
+                    )
+                return
+
+            if self._should_retry_first_frame_transfer(e):
+                return
+
+            if self._scan_stop_requested or self.scanner_manager._stop_event.is_set():
+                logger.info(f"扫描已停止: {e}")
+                self._finish_scan(
+                    success=True,
+                    title="扫描已停止",
+                    message="停止请求已响应，已保存当前接收到的页面",
+                    empty_is_error=False,
+                )
             else:
-                logger.info(f"图像传输结束或中断: {e}")
-            self._finish_scan()
+                logger.error(f"图像传输中断: {e}")
+                self._finish_scan(
+                    success=False,
+                    title="扫描中断",
+                    message=f"图像传输中断，已保存 {self._scan_page_count} 页: {e}",
+                )
             return
 
         # ---------------------------------------------------------------
         # 关键：先保存图像，再判断是否结束
         # count=0 表示这是最后一帧，handle 依然有效，必须先保存再 finish
-        # 保存完成后在回调里判断是否调 _finish_scan，避免 Source 提前关闭
+        # 停止扫描后也继续接收驱动缓存页，避免 Source 提前关闭导致丢页
         # ---------------------------------------------------------------
-        is_last_frame = (
-            count == 0
-            or (
-                self.scanner_manager._stop_event.is_set()
-                and count != _TWAIN_COUNT_UNKNOWN
-            )
-            or (
-                count == _TWAIN_COUNT_UNKNOWN
-                and self.scanner_manager._stop_event.is_set()
-            )
-        )
+        is_last_frame = count == 0
 
         if handle:
             self._scan_page_count += 1
@@ -2191,15 +2263,17 @@ class ScanWindow(FramelessWindow):
                 save_path = self.scanner_manager._resolve_save_path(
                     p["file_name"], p["save_format"], p["save_path"]
                 )
-            p["scan_result"].append(os.path.basename(save_path))
             logger.info(f"成功取得第 {self._scan_page_count} 帧，准备保存: {save_path}")
 
             # 图像保存：同步执行（在主线程），保证 Source 关闭前保存完成
             # DIB handle 在 _save_image 内部通过 DIBToBMFile 使用，不依赖 Source 连接状态
+            save_error = None
             try:
                 self.scanner_manager._save_image(handle, save_path)
+                p["scan_result"].append(os.path.basename(save_path))
                 logger.info(f"图片保存完成: {save_path}")
             except Exception as save_err:
+                save_error = save_err
                 logger.error(f"图片保存失败: {save_err}")
             finally:
                 # 必须释放 DIB 句柄，否则内存泄漏
@@ -2210,27 +2284,122 @@ class ScanWindow(FramelessWindow):
                 except Exception:
                     pass
 
-        if is_last_frame:
-            self._finish_scan()
+            if save_error is not None:
+                self._finish_scan(
+                    success=False,
+                    title="保存失败",
+                    message=f"扫描图像保存失败，已停止继续扫描: {save_error}",
+                )
+                return
 
-    def _finish_scan(self):
+            if self._scan_stop_requested:
+                self._scan_stop_drain_deadline = (
+                    time.time() + self._scan_stop_drain_timeout
+                )
+
+        if is_last_frame:
+            if self._scan_page_count == 0:
+                self._finish_scan(
+                    success=False,
+                    title="扫描未完成",
+                    message="扫描仪未返回任何图像，请检查进纸器或驱动状态",
+                )
+            else:
+                if self._scan_stop_requested:
+                    self._finish_scan(
+                        success=True,
+                        title="扫描已停止",
+                        message="停止请求已响应，扫描仪已传输页面已全部保存",
+                        empty_is_error=False,
+                    )
+                else:
+                    self._finish_scan()
+
+    def _should_retry_first_frame_transfer(self, error):
+        if self._scan_page_count > 0:
+            return False
+
+        now = time.time()
+        if self._scan_stop_requested:
+            self._scan_last_transfer_error = error
+            if now <= self._scan_stop_drain_deadline:
+                if now - self._scan_last_wait_log_time >= 1.0:
+                    logger.info(f"停止后等待扫描仪传输已扫描页面: {error}")
+                    self._scan_last_wait_log_time = now
+                return True
+            return False
+
+        if self.scanner_manager._stop_event.is_set():
+            return False
+
+        self._scan_last_transfer_error = error
+        if now <= self._scan_first_frame_deadline:
+            if now - self._scan_last_wait_log_time >= 1.0:
+                logger.info(f"扫描仪首帧未就绪，继续等待: {error}")
+                self._scan_last_wait_log_time = now
+            return True
+
+        logger.error(f"等待扫描仪首帧超时: {error}")
+        self._finish_scan(
+            success=False,
+            title="扫描失败",
+            message=f"等待扫描仪图像超时，请检查进纸器或驱动状态: {error}",
+        )
+        return True
+
+    def _finish_scan(self, success=True, title=None, message=None, empty_is_error=True):
         """停止轮询，断开扫描仪，触发完成逻辑"""
         self._scan_timer.stop()
+        self._scan_session_id += 1
         self.is_scanning = False
         self.scanner_manager._reset_twain_session()
         self.scanner_manager.disconnect_scanner()
+        self._clear_scan_stop_request()
 
-        scan_files_count = self._scan_page_count
+        raw_scan_files_count = self._scan_page_count
         save_path = self._scan_params.get("save_path", "")
         scan_files_list = self._scan_params.get("scan_result", [])
+        blank_deleted_count = 0
 
+        if self._scan_params.get("scan_format") == 1:
+            cleanup_result = self._cleanup_blank_pages_after_duplex_scan(
+                save_path, scan_files_list
+            )
+            scan_files_list = cleanup_result["files_list"]
+            blank_deleted_count = cleanup_result["deleted_count"]
+            self._scan_params["scan_result"] = scan_files_list
+
+        scan_files_count = len(scan_files_list)
         self.scan_files_count += scan_files_count
-        logger.info(f"扫描完成，本次共 {scan_files_count} 页")
+        logger.info(
+            f"扫描结束，状态: {'完成' if success else '异常'}，"
+            f"原始 {raw_scan_files_count} 页，"
+            f"保留 {scan_files_count} 页，删除空白页 {blank_deleted_count} 页"
+        )
 
         self.clear_preview_area()
-        self.load_folder_images(self.current_folder_path)
+        self.load_folder_images(self.current_folder_path, force_fs=True)
         self.refresh_file_tree()
         self.update_scan_total()
+
+        if scan_files_count == 0:
+            self._set_scan_buttons_enabled(True)
+            if empty_is_error:
+                show_error(
+                    self,
+                    title or "扫描失败",
+                    message or "本次未扫描到有效图像，请检查扫描仪后重试",
+                    4000,
+                )
+            else:
+                show_info(
+                    self,
+                    title or "扫描已停止",
+                    message or "扫描已停止，本次未保存扫描件",
+                    3000,
+                )
+            return
+
         self.manger_scan_files(
             dir_name=os.path.basename(save_path), files_list=scan_files_list
         )
@@ -2243,8 +2412,11 @@ class ScanWindow(FramelessWindow):
             "operator_remark": (
                 f"扫描档案; 扫描保存文件路径：{self.current_folder_path}; "
                 f"本次扫描数: {scan_files_count}; "
+                f"原始扫描数: {raw_scan_files_count}; "
+                f"删除空白页数: {blank_deleted_count}; "
                 f"扫描方式: {'单面扫描' if self.scan_format_value == 0 else '双面扫描'}; "
-                f"扫描模式: {self.scan_mode}"
+                f"扫描模式: {self.scan_mode}; "
+                f"扫描状态: {'完成' if success else '中断'}"
             ),
         }
         if str(Path(self.current_folder_path)) not in self.create_new_dirs_list:
@@ -2255,7 +2427,16 @@ class ScanWindow(FramelessWindow):
             logger.error(f"添加操作日志失败: {oe}")
 
         self._set_scan_buttons_enabled(True)
-        show_success(self, "扫描完成", f"本次共扫描 {scan_files_count} 页", 2000)
+        success_message = f"本次共扫描 {scan_files_count} 页"
+        if blank_deleted_count > 0:
+            success_message += f"，已删除空白页 {blank_deleted_count} 页"
+        if message:
+            success_message += f"，{message}"
+
+        if success:
+            show_success(self, title or "扫描完成", success_message, 2000)
+        else:
+            show_warning(self, title or "扫描中断", success_message, 4000)
 
         # ── 替换扫描完成后，检测被替换图片是否有未处理的质检标记 ──
         if (
@@ -2269,13 +2450,284 @@ class ScanWindow(FramelessWindow):
                     lambda p=replaced_path: self._check_and_close_mark_after_rescan(p),
                 )
 
+    def _cleanup_blank_pages_after_duplex_scan(self, save_path, scan_files_list):
+        result = {
+            "files_list": scan_files_list,
+            "deleted_count": 0,
+        }
+
+        if not save_path or not os.path.isdir(save_path):
+            logger.warning(f"双面扫描空白页检测跳过，目录不存在: {save_path}")
+            return result
+
+        target_files = [
+            os.path.basename(file_name)
+            for file_name in scan_files_list
+            if os.path.isfile(os.path.join(save_path, os.path.basename(file_name)))
+        ]
+        if not target_files:
+            logger.info("双面扫描空白页检测跳过，本次没有可检测图片")
+            return result
+
+        scan_record_exists = self._get_scan_record_by_folder(save_path) is not None
+        if scan_record_exists:
+            process_target_files = target_files
+            start_index = self._next_scan_file_index(
+                save_path, exclude_files=target_files
+            )
+            logger.info("当前目录已有扫描记录，仅清理本次双面扫描文件")
+        else:
+            process_target_files = None
+            start_index = 1
+            logger.info("当前目录未入库，清理并重排整个扫描目录")
+
+        try:
+            detector = BlankPageDetector()
+            cleanup = detector.process_directory(
+                save_path,
+                target_files=process_target_files,
+                filename_prefix=self._scan_params.get("file_name"),
+                start_index=start_index,
+            )
+        except Exception as exc:
+            logger.error(f"双面扫描空白页检测失败: {exc}")
+            show_warning(self, "空白页检测失败", f"扫描件已保留，原因: {exc}")
+            return result
+
+        deleted_files = set(cleanup.get("deleted", []))
+        rename_map = cleanup.get("rename", {})
+        cleaned_files_list = [
+            rename_map.get(os.path.basename(file_name), os.path.basename(file_name))
+            for file_name in scan_files_list
+            if os.path.basename(file_name) not in deleted_files
+        ]
+
+        deleted_count = len(
+            [
+                file_name
+                for file_name in scan_files_list
+                if os.path.basename(file_name) in deleted_files
+            ]
+        )
+
+        logger.info(
+            f"双面扫描空白页检测完成，删除 {deleted_count} 页，"
+            f"保留 {len(cleaned_files_list)} 页"
+        )
+        if cleanup.get("errors"):
+            logger.warning(f"部分扫描件空白页检测失败: {cleanup['errors']}")
+
+        return {
+            "files_list": cleaned_files_list,
+            "deleted_count": deleted_count,
+        }
+
+    def _next_scan_file_index(self, dir_path, exclude_files=None):
+        excluded = {os.path.basename(name) for name in (exclude_files or [])}
+        max_index = 0
+
+        try:
+            entries = os.listdir(dir_path)
+        except OSError as exc:
+            logger.warning(f"读取扫描目录失败，重命名从 1 开始: {exc}")
+            return 1
+
+        for file_name in entries:
+            if file_name in excluded:
+                continue
+            file_path = os.path.join(dir_path, file_name)
+            if not os.path.isfile(file_path):
+                continue
+            if os.path.splitext(file_name)[1].lower() not in IMG_EXTENSIONS:
+                continue
+            max_index = max(max_index, self._extract_scan_file_index(file_name))
+
+        return max_index + 1
+
+    @staticmethod
+    def _extract_scan_file_index(file_name):
+        stem = os.path.splitext(os.path.basename(file_name))[0]
+        matches = re.findall(r"(\d+)", stem)
+        return int(matches[-1]) if matches else 0
+
+    def _clear_scan_stop_request(self):
+        self._scan_stop_requested = False
+        self._scan_stop_drain_deadline = 0.0
+
+        clear_method = getattr(self.scanner_manager, "clear_stop_request", None)
+        if callable(clear_method):
+            try:
+                clear_method()
+                return
+            except Exception as exc:
+                logger.warning(f"清除扫描停止标志失败: {exc}")
+
+        stop_event = getattr(self.scanner_manager, "_stop_event", None)
+        if stop_event is not None:
+            try:
+                stop_event.clear()
+            except Exception as exc:
+                logger.warning(f"清除扫描停止标志失败: {exc}")
+
+    def _cancel_active_scan_session(self):
+        manager = self.scanner_manager
+        stop_event = getattr(manager, "_stop_event", None)
+        if stop_event is not None:
+            try:
+                stop_event.set()
+            except Exception as exc:
+                logger.warning(f"设置扫描停止标志失败: {exc}")
+
+        abort_method = getattr(manager, "abort_active_scan", None)
+        if callable(abort_method):
+            try:
+                if abort_method():
+                    return True
+            except Exception as exc:
+                logger.warning(f"取消扫描仪采集失败: {exc}")
+
+        # 兜底：即使运行时加载到旧版扫描器，也直接取消 TWAIN Source。
+        source = getattr(manager, "_source", None)
+        source_manager = getattr(manager, "_source_manager", None)
+        cancelled = False
+
+        if source is not None:
+            for method_name in ("cancel_acquire", "CancelAcquire"):
+                cancel_method = getattr(source, method_name, None)
+                if not callable(cancel_method):
+                    continue
+                try:
+                    cancel_method()
+                    cancelled = True
+                    logger.info(f"已直接调用扫描仪取消接口: {method_name}")
+                    break
+                except Exception as exc:
+                    logger.warning(f"直接调用扫描仪取消接口失败 {method_name}: {exc}")
+
+            try:
+                source.close()
+                cancelled = True
+                logger.info("已直接关闭扫描仪 Source")
+            except Exception as exc:
+                logger.debug(f"直接关闭扫描仪 Source 失败: {exc}")
+
+        if source_manager is not None:
+            for method_name in ("close", "destroy", "Destroy"):
+                release_method = getattr(source_manager, method_name, None)
+                if not callable(release_method):
+                    continue
+                try:
+                    release_method()
+                    break
+                except Exception as exc:
+                    logger.debug(f"直接释放 SourceManager 失败 {method_name}: {exc}")
+
+        for attr_name, value in (
+            ("_source", None),
+            ("_source_manager", None),
+            ("_is_connected", False),
+            ("_scanner_name", None),
+        ):
+            try:
+                setattr(manager, attr_name, value)
+            except Exception:
+                pass
+
+        return cancelled
+
+    def _mark_scan_stopped(self):
+        try:
+            self._scan_timer.stop()
+        except Exception as exc:
+            logger.debug(f"停止扫描定时器失败: {exc}")
+        self.is_scanning = False
+        self._set_scan_buttons_enabled(True)
+
+    def _refresh_after_stop_scan(self, scan_files_list):
+        if not scan_files_list:
+            return
+
+        save_path = self._scan_params.get("save_path", "")
+        if save_path:
+            self.manger_scan_files(
+                dir_name=os.path.basename(save_path), files_list=scan_files_list
+            )
+        if self.current_folder_path:
+            current_path = str(Path(self.current_folder_path))
+            if current_path not in self.create_new_dirs_list:
+                self.create_new_dirs_list.append(current_path)
+
+        try:
+            self.clear_preview_area()
+            self.load_folder_images(self.current_folder_path, force_fs=True)
+            self.refresh_file_tree()
+            self.update_scan_total()
+        except Exception as exc:
+            logger.warning(f"停止扫描后刷新界面失败: {exc}")
+
+    def _request_graceful_scan_stop(self):
+        self._scan_stop_requested = True
+        self._scan_stop_drain_deadline = time.time() + self._scan_stop_drain_timeout
+
+        stop_method = getattr(self.scanner_manager, "request_feeder_stop", None)
+        if callable(stop_method):
+            try:
+                return stop_method()
+            except Exception as exc:
+                logger.warning(f"请求扫描仪停止进纸失败: {exc}")
+
+        request_stop = getattr(self.scanner_manager, "request_stop", None)
+        if callable(request_stop):
+            try:
+                request_stop(cancel_driver=False)
+                return False
+            except TypeError:
+                request_stop()
+                return False
+            except Exception as exc:
+                logger.warning(f"请求扫描停止失败: {exc}")
+
+        stop_event = getattr(self.scanner_manager, "_stop_event", None)
+        if stop_event is not None:
+            try:
+                stop_event.set()
+            except Exception as exc:
+                logger.warning(f"设置扫描停止标志失败: {exc}")
+
+        return False
+
     def scan_stop_fun(self):
         if self.is_scanning:
+            if self._scan_stop_requested:
+                logger.info(
+                    f"【{self.current_user['username']}】 再次请求停止扫描，强制结束采集会话"
+                )
+                self._scan_timer.stop()
+                driver_cancelled = self._cancel_active_scan_session()
+                force_message = (
+                    "已强制结束当前采集会话，已保存当前接收到的页面"
+                    if driver_cancelled
+                    else "已请求结束当前采集会话，已保存当前接收到的页面"
+                )
+                self._finish_scan(
+                    success=False,
+                    title="扫描已停止",
+                    message=force_message,
+                    empty_is_error=False,
+                )
+                return
+
             logger.info(f"【{self.current_user['username']}】 请求停止扫描")
-            self.scanner_manager.request_stop()
-            show_info(self, "停止扫描", "停止请求已发送，当前帧传输完毕后自动停止")
+            feeder_stop_requested = self._request_graceful_scan_stop()
+            stop_message = (
+                "已请求扫描仪停止进纸，正在接收已扫描页面"
+                if feeder_stop_requested
+                else "已发送停止请求，正在接收扫描仪已传输页面"
+            )
+            show_info(self, "正在停止扫描", stop_message, 3000)
         else:
             self.scanner_manager.disconnect_scanner()
+            self._clear_scan_stop_request()
             self._set_scan_buttons_enabled(True)
 
     def _set_scan_buttons_enabled(self, enabled: bool):

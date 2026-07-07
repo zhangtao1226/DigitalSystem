@@ -6,10 +6,8 @@
 # @Software  : PyCharm
 import gc
 import os
-import io
-import fitz
-import json
 from PIL import Image
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -47,7 +45,7 @@ class DualLayerPDFGenerator:
     def image_to_pdf(self, image_paths: list, output_pdf_path: str, raw_result: list):
         self.get_font_path()
 
-        pdf_doc = fitz.open()
+        pdf_canvas = None
         success_count = 0
 
         for idx, img_path in enumerate(image_paths):
@@ -65,22 +63,28 @@ class DualLayerPDFGenerator:
                 scale, ox, oy, sw, sh = self._calc_layout(img_w_px, img_h_px)
                 logger.info(f"{tag} 缩放：{sw:.1f}×{sh:.1f}pt  偏移：({ox:.1f},{oy:.1f})")
 
-                page = pdf_doc.new_page(width=TARGET_PAGE_W, height=TARGET_PAGE_H)
-                img_rect = fitz.Rect(ox, oy, ox + sw, oy + sh)
-                page.insert_image(img_rect, filename=img_path)
+                if pdf_canvas is None:
+                    os.makedirs(os.path.dirname(os.path.abspath(output_pdf_path)), exist_ok=True)
+                    pdf_canvas = rl_canvas.Canvas(output_pdf_path, pagesize=(TARGET_PAGE_W, TARGET_PAGE_H))
 
-                lines = self._parse_ocr_result(raw_result[idx])
+                image_y = TARGET_PAGE_H - oy - sh
+                pdf_canvas.drawImage(
+                    ImageReader(img_path),
+                    ox,
+                    image_y,
+                    width=sw,
+                    height=sh,
+                    mask="auto",
+                )
 
-                text_pdf_bytes = self._build_text_layer(lines, scale, ox, oy)
+                ocr_result = raw_result[idx] if idx < len(raw_result) else {}
+                lines = self._parse_ocr_result(ocr_result)
+                written = self._draw_invisible_text(pdf_canvas, lines, scale, ox, oy)
 
-                if text_pdf_bytes:
-                    text_doc = fitz.open("pdf", text_pdf_bytes)
-                    if text_doc.page_count > 0:
-                        page.show_pdf_page(page.rect, text_doc, 0, overlay=True)
-                    text_doc.close()
-                else:
+                if written <= 0:
                     logger.error(f"无文本内容可写入")
 
+                pdf_canvas.showPage()
                 success_count += 1
                 logger.info(f"{tag}; 完成\n")
                 gc.collect()
@@ -90,14 +94,11 @@ class DualLayerPDFGenerator:
                 traceback.print_exc()
                 continue
 
-        if pdf_doc.page_count > 0:
-            os.makedirs(os.path.dirname(os.path.abspath(output_pdf_path)), exist_ok=True)
-            pdf_doc.save(output_pdf_path, deflate=True, clean=True)
-            pdf_doc.close()
+        if pdf_canvas is not None and success_count > 0:
+            pdf_canvas.save()
             logger.info(f"双层PDF已生成：{output_pdf_path}; 成功页数 : {success_count} / {len(image_paths)}")
             return True
         else:
-            pdf_doc.close()
             return False
 
     def _parse_ocr_result(self, raw_result) -> list:
@@ -147,13 +148,11 @@ class DualLayerPDFGenerator:
         oy = (TARGET_PAGE_H - sh) / 2
         return scale, ox, oy, sw, sh
 
-    def _build_text_layer(self, lines: list, scale: float, ox: float, oy: float) -> bytes | None:
+    def _draw_invisible_text(self, pdf_canvas, lines: list, scale: float, ox: float, oy: float) -> int:
         if not lines:
-            return None
+            return 0
 
         self.get_font_path()
-        buf = io.BytesIO()
-        c = rl_canvas.Canvas(buf, pagesize=(TARGET_PAGE_W, TARGET_PAGE_H))
         written = 0
 
         for (box, text, score) in lines:
@@ -180,20 +179,19 @@ class DualLayerPDFGenerator:
                 rl_x = mu_x0
                 rl_base = TARGET_PAGE_H - mu_y1
 
-                t = c.beginText(rl_x, rl_base)
+                t = pdf_canvas.beginText(rl_x, rl_base)
                 t.setFont(FONT_REG_NAME, fontsize)
                 t.setTextRenderMode(3)
                 t.textOut(text)
-                c.drawText(t)
+                pdf_canvas.drawText(t)
                 written += 1
 
             except Exception as e:
                 logger.warning(f"跳过行（{text[:10]}...）：{e}")
                 continue
 
-        c.save()
         logger.info(f"隐形文本写入 {written} 条")
-        return buf.getvalue() if written > 0 else None
+        return written
 
     def get_font_path(self) -> str:
         global _FONT_PATH

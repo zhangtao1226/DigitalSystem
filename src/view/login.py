@@ -14,11 +14,12 @@ from PySide6.QtWidgets import (
     QApplication, QVBoxLayout, QHBoxLayout,
     QLabel, QWidget, QComboBox, QPushButton
 )
-from PySide6.QtCore import Qt, QRect, QTimer, QSettings, QSize
+from PySide6.QtCore import Qt, QRect, QTimer, QSettings, QSize, QObject, QThread, Signal
 from PySide6.QtGui import (
     QKeyEvent, QFont, QPixmap, QPainter,
     QBrush, QLinearGradient, QColor, QPen, QIcon
 )
+from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.security import check_password_hash
 from qfluentwidgets import (
     PrimaryPushButton, LineEdit, FluentIcon,
@@ -26,12 +27,13 @@ from qfluentwidgets import (
 )
 from qframelesswindow import FramelessWindow
 
+from src.core.db import check_database_connection
 from src.core.settings import settings
 from src.utils.LoggerDetector import logger
 from src.core.cache_manager import global_cache
-from src.services.user_service import user_service
+from src.services.user_service import UserService, user_service
 from src.services.operation_service import operation_service
-from src.utils.NotificationTool import show_error, show_warning, show_success
+from src.utils.NotificationTool import show_error, show_warning, show_success, show_info
 
 load_dotenv(verbose=True)
 
@@ -43,6 +45,79 @@ else:
 def _res(filename: str) -> str:
     base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, filename)
+
+
+class DatabaseUsernameLoader(QObject):
+    finished = Signal(bool, object)
+
+    def run(self):
+        service = None
+        try:
+            if not check_database_connection():
+                self.finished.emit(False, [])
+                return
+
+            service = UserService()
+            usernames = [user.username for user in service.get_all_users()]
+            self.finished.emit(True, usernames)
+        except SQLAlchemyError as e:
+            logger.warning(f"加载用户名下拉列表失败: {e}")
+            self.finished.emit(False, [])
+        except Exception as e:
+            logger.warning(f"加载用户名下拉列表失败: {e}")
+            self.finished.emit(False, [])
+        finally:
+            if service is not None:
+                service.db.close()
+
+
+class LoginWorker(QObject):
+    finished = Signal(str, object)
+
+    def __init__(self, username: str, password: str):
+        super().__init__()
+        self.username = username
+        self.password = password
+
+    def run(self):
+        service = None
+        try:
+            if not check_database_connection():
+                self.finished.emit("database_error", None)
+                return
+
+            service = UserService()
+            user = service.get_user_by_username(self.username)
+            if not user:
+                self.finished.emit("user_not_found", None)
+                return
+
+            if user.is_active is False:
+                self.finished.emit("user_disabled", None)
+                return
+
+            if not check_password_hash(user.password, self.password):
+                self.finished.emit("password_error", None)
+                return
+
+            role_names = [role.name for role in user.roles]
+            user_info = {
+                "username": self.username,
+                "login_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "role": role_names[0] if role_names else "",
+            }
+            service.update_login_time(user.id)
+            self.finished.emit("success", user_info)
+        except SQLAlchemyError as e:
+            logger.error(f"登录失败: 数据库连接失败; {e}")
+            self.finished.emit("database_error", None)
+        except Exception as e:
+            logger.error(f"登录失败: {e}")
+            self.finished.emit("login_error", None)
+        finally:
+            if service is not None:
+                service.db.close()
+
 
 class LoginPanel(QWidget):
     def __init__(self, parent=None):
@@ -72,6 +147,11 @@ class LoginWindow(FramelessWindow):
 
     def __init__(self):
         super().__init__()
+        self._database_available = None
+        self._username_loader_thread = None
+        self._username_loader_worker = None
+        self._login_thread = None
+        self._login_worker = None
         self.setWindowTitle("系统登录")
         self.resize(1400, 850)
         self.set_center()
@@ -168,6 +248,7 @@ class LoginWindow(FramelessWindow):
         self._username_line().returnPressed.connect(self.focus_password_field)
 
         self._load_username_options()
+        QTimer.singleShot(0, self._start_database_username_loader)
         self._password_line().setText("123456")
 
 
@@ -315,15 +396,44 @@ class LoginWindow(FramelessWindow):
     def _username_combo(self) -> QComboBox:
         return self.username_edit._combo
 
-    def _load_username_options(self):
-        usernames = []
-        stored_usernames = self._stored_username_history()
-        usernames.extend(stored_usernames)
+    def _show_database_connection_error(self):
+        show_info(self, "提示", "数据库连接失败", duration=5000)
 
-        try:
-            usernames.extend([user.username for user in user_service.get_all_users()])
-        except Exception as e:
-            logger.warning(f"加载用户名下拉列表失败: {e}")
+    def _load_username_options(self):
+        self._set_username_options(self._stored_username_history())
+
+    def _start_database_username_loader(self):
+        if self._username_loader_thread and self._username_loader_thread.isRunning():
+            return
+
+        self._username_loader_thread = QThread(self)
+        self._username_loader_worker = DatabaseUsernameLoader()
+        self._username_loader_worker.moveToThread(self._username_loader_thread)
+
+        self._username_loader_thread.started.connect(self._username_loader_worker.run)
+        self._username_loader_worker.finished.connect(self._on_database_username_options_loaded)
+        self._username_loader_worker.finished.connect(self._username_loader_thread.quit)
+        self._username_loader_worker.finished.connect(self._username_loader_worker.deleteLater)
+        self._username_loader_thread.finished.connect(self._username_loader_thread.deleteLater)
+        self._username_loader_thread.finished.connect(self._clear_username_loader)
+        self._username_loader_thread.start()
+
+    def _on_database_username_options_loaded(self, connected: bool, usernames):
+        self._database_available = connected
+        if connected:
+            self._set_username_options(self._stored_username_history() + list(usernames))
+        else:
+            logger.warning("加载用户名下拉列表失败: 数据库连接失败")
+            self._show_database_connection_error()
+
+    def _clear_username_loader(self):
+        self._username_loader_thread = None
+        self._username_loader_worker = None
+
+    def _set_username_options(self, usernames):
+        current_username = self._username_line().text().strip()
+        if current_username:
+            usernames = [current_username] + list(usernames)
 
         if "admin" not in usernames:
             usernames.append("admin")
@@ -336,7 +446,7 @@ class LoginWindow(FramelessWindow):
         combo = self._username_combo()
         combo.clear()
         combo.addItems(unique_usernames)
-        self._username_line().setText(unique_usernames[0] if unique_usernames else "admin")
+        self._username_line().setText(current_username or (unique_usernames[0] if unique_usernames else "admin"))
 
     def _save_username_history(self, username: str):
         stored_usernames = self._stored_username_history()
@@ -376,32 +486,67 @@ class LoginWindow(FramelessWindow):
             self._password_line().setFocus()
             return
 
-        user = user_service.get_user_by_username(username)
+        if self._database_available is False:
+            self._show_database_connection_error()
+            return
 
-        if not user:
+        if self._login_thread and self._login_thread.isRunning():
+            return
+
+        self.login_button.setEnabled(False)
+        self.login_button.setText("登录中...")
+
+        self._login_thread = QThread(self)
+        self._login_worker = LoginWorker(username, password)
+        self._login_worker.moveToThread(self._login_thread)
+
+        self._login_thread.started.connect(self._login_worker.run)
+        self._login_worker.finished.connect(self._on_login_finished)
+        self._login_worker.finished.connect(self._login_thread.quit)
+        self._login_worker.finished.connect(self._login_worker.deleteLater)
+        self._login_thread.finished.connect(self._login_thread.deleteLater)
+        self._login_thread.finished.connect(self._clear_login_worker)
+        self._login_thread.start()
+
+    def _on_login_finished(self, status: str, user_info):
+        self.login_button.setEnabled(True)
+        self.login_button.setText("登  录")
+
+        if status == "database_error":
+            self._database_available = False
+            self._show_database_connection_error()
+            return
+
+        if status == "user_not_found":
+            self._database_available = True
             show_error(self, "登录错误", "用户不存在！")
             return
 
-        if user.is_active is False:
+        if status == "user_disabled":
+            self._database_available = True
             show_warning(self, "警告提示", "该用户名已被禁用！")
             return
 
-        if check_password_hash(user.password, password):
-            user_info = {
-                "username": username,
-                "login_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "role": [role.name for role in user.roles][0],
-            }
-
-            global_cache.set("current_user", user_info)
-            self._save_username_history(username)
-            user_service.update_login_time(user.id)
-            logger.info(f"用户登录; username: {username}; role: {user.roles}")
-            self._open_main_window()
-        else:
+        if status == "password_error":
+            self._database_available = True
             show_error(self, "登录错误", "账号或密码错误")
             self._password_line().clear()
             self._password_line().setFocus()
+            return
+
+        if status == "success":
+            self._database_available = True
+            global_cache.set("current_user", user_info)
+            self._save_username_history(user_info["username"])
+            logger.info(f"用户登录; username: {user_info['username']}; role: {user_info['role']}")
+            self._open_main_window()
+            return
+
+        show_error(self, "登录错误", "登录失败，请稍后重试")
+
+    def _clear_login_worker(self):
+        self._login_thread = None
+        self._login_worker = None
 
 
     def _open_main_window(self):

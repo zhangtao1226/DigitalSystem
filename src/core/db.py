@@ -5,7 +5,8 @@
 # @Time      : 2025/12/1 10:57
 # @Software  : PyCharm
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import os
@@ -23,13 +24,13 @@ DB_NAME = os.getenv("DB_NAME", "test1")
 
 # 构建PostgreSQL连接URL
 SQLALCHEMY_DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
 
 # 创建数据库引擎（echo=True：打印SQL语句，开发环境可用）
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     echo=False,  # 生产环境关闭SQL打印
     pool_pre_ping=True,  # 连接前检查可用性，避免无效连接
+    connect_args={"connect_timeout": 3},
 )
 
 # 创建会话工厂（每次请求创建一个会话，线程安全）
@@ -37,6 +38,16 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # 基础模型类（所有ORM模型都继承此类）
 Base = declarative_base()
+
+
+def check_database_connection() -> bool:
+    """检查数据库是否可以正常连接。"""
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        return True
+    except SQLAlchemyError:
+        return False
 
 # 获取数据库会话（依赖注入模式，方便使用）
 def get_db():
