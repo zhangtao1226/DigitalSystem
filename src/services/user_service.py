@@ -17,6 +17,20 @@ from src.core.db import SessionLocal
 from src.services.role_service import role_service
 
 
+def _coerce_datetime(value=None):
+    if value is None or value == "":
+        return datetime.now()
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                pass
+    return value
+
+
 class UserService:
     """用户服务类"""
     def __init__(self, db: Optional[Session] = None):
@@ -44,8 +58,8 @@ class UserService:
             username=data['username'],
             password=generate_password_hash(data['password']),
             is_active=data['is_active'],
-            create_time=data['create_time'] if 'create_time' in data else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            update_time=data['update_time'] if 'update_time' in data else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            create_time=_coerce_datetime(data.get('create_time')),
+            update_time=_coerce_datetime(data.get('update_time')),
         )
         if data['roles']:
             roles = [
@@ -114,7 +128,7 @@ class UserService:
 
     def update_login_time(self, user_id):
         user = self.get_user_by_id(user_id)
-        user.last_login = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        user.last_login = datetime.now()
         self.db.commit()
         self.db.refresh(user)
 

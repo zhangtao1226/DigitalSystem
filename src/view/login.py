@@ -7,6 +7,7 @@
 
 import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -27,7 +28,9 @@ from qfluentwidgets import (
 )
 from qframelesswindow import FramelessWindow
 
-from src.core.db import check_database_connection
+from src.core.db import (
+    initialize_database_tables,
+)
 from src.core.settings import settings
 from src.utils.LoggerDetector import logger
 from src.core.cache_manager import global_cache
@@ -35,7 +38,9 @@ from src.services.user_service import UserService, user_service
 from src.services.operation_service import operation_service
 from src.utils.NotificationTool import show_error, show_warning, show_success, show_info
 
-load_dotenv(verbose=True)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ENV_PATH = PROJECT_ROOT / ".env"
+load_dotenv(ENV_PATH, verbose=True, override=True)
 
 if os.getenv("DATABASE_SWITCH") == "TRUE":
     DATABASE_SWITCH = True
@@ -48,24 +53,21 @@ def _res(filename: str) -> str:
 
 
 class DatabaseUsernameLoader(QObject):
-    finished = Signal(bool, object)
+    finished = Signal(str, object)
 
     def run(self):
         service = None
         try:
-            if not check_database_connection():
-                self.finished.emit(False, [])
-                return
-
+            initialize_database_tables()
             service = UserService()
             usernames = [user.username for user in service.get_all_users()]
-            self.finished.emit(True, usernames)
+            self.finished.emit("success", usernames)
         except SQLAlchemyError as e:
             logger.warning(f"加载用户名下拉列表失败: {e}")
-            self.finished.emit(False, [])
+            self.finished.emit("database_error", str(e))
         except Exception as e:
             logger.warning(f"加载用户名下拉列表失败: {e}")
-            self.finished.emit(False, [])
+            self.finished.emit("init_error", str(e))
         finally:
             if service is not None:
                 service.db.close()
@@ -82,10 +84,7 @@ class LoginWorker(QObject):
     def run(self):
         service = None
         try:
-            if not check_database_connection():
-                self.finished.emit("database_error", None)
-                return
-
+            initialize_database_tables()
             service = UserService()
             user = service.get_user_by_username(self.username)
             if not user:
@@ -109,7 +108,7 @@ class LoginWorker(QObject):
             service.update_login_time(user.id)
             self.finished.emit("success", user_info)
         except SQLAlchemyError as e:
-            logger.error(f"登录失败: 数据库连接失败; {e}")
+            logger.error(f"登录失败: 本地数据库异常; {e}")
             self.finished.emit("database_error", None)
         except Exception as e:
             logger.error(f"登录失败: {e}")
@@ -396,8 +395,11 @@ class LoginWindow(FramelessWindow):
     def _username_combo(self) -> QComboBox:
         return self.username_edit._combo
 
-    def _show_database_connection_error(self):
-        show_info(self, "提示", "数据库连接失败", duration=5000)
+    def _show_database_connection_error(self, detail: str = ""):
+        message = "本地数据库异常"
+        if detail:
+            message = f"{message}: {detail}"
+        show_error(self, "提示", message, duration=8000)
 
     def _load_username_options(self):
         self._set_username_options(self._stored_username_history())
@@ -418,13 +420,16 @@ class LoginWindow(FramelessWindow):
         self._username_loader_thread.finished.connect(self._clear_username_loader)
         self._username_loader_thread.start()
 
-    def _on_database_username_options_loaded(self, connected: bool, usernames):
-        self._database_available = connected
-        if connected:
-            self._set_username_options(self._stored_username_history() + list(usernames))
+    def _on_database_username_options_loaded(self, status: str, result):
+        self._database_available = status == "success"
+        if status == "success":
+            self._set_username_options(self._stored_username_history() + list(result))
+        elif status == "init_error":
+            logger.warning(f"加载用户名下拉列表失败: 数据库初始化失败; {result}")
+            show_error(self, "提示", f"数据库初始化失败: {result}", duration=8000)
         else:
-            logger.warning("加载用户名下拉列表失败: 数据库连接失败")
-            self._show_database_connection_error()
+            logger.warning(f"加载用户名下拉列表失败: 本地数据库异常; {result}")
+            self._show_database_connection_error(result)
 
     def _clear_username_loader(self):
         self._username_loader_thread = None
@@ -484,10 +489,6 @@ class LoginWindow(FramelessWindow):
         if not password:
             show_error(self, "提示", "请输入密码")
             self._password_line().setFocus()
-            return
-
-        if self._database_available is False:
-            self._show_database_connection_error()
             return
 
         if self._login_thread and self._login_thread.isRunning():

@@ -16,6 +16,7 @@ from src.models.scan_images import ScanImages
 from src.models.task_mark_model import TaskMark
 from src.models.archive_stamp import ArchiveStamp
 from src.models.task_progress import TaskProgress
+from src.models.submit_record import SubmitRecord
 from src.models.define_template import DefineTemplate
 from src.models.register_question import RegisterQuestion
 from src.models.association import user_role_association
@@ -24,4 +25,5 @@ from src.models.role_permission_association import role_permission_association
 
 
 __all__ = ["User", "Role", "user_role_association", "Register", "RegisterQuestion", "Task", "TaskProgress", "ArchiveStamp",
-           "Workflow", "role_permission_association", "Scan", "Director", "Operation", "DefineTemplate", "ScanImages", "TaskMark"]
+           "Workflow", "role_permission_association", "Scan", "Director", "Operation", "DefineTemplate", "ScanImages", "TaskMark",
+           "SubmitRecord"]

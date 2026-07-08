@@ -14,7 +14,7 @@
 
 - 用户登录与角色权限控制。
 - 档案领卷登记、拆卷/前处理、扫描、图像处理、分件、成品转换/输出、装订、目录录入/校对、任务分发、系统管理、统计。
-- PostgreSQL 数据库存储，SQLAlchemy ORM 访问。
+- SQLite 内置数据库存储，SQLAlchemy ORM 访问。
 - PaddleOCR 本地 OCR 模型识别。
 - TWAIN 扫描仪连接与扫描。
 - 图片上传/下载 API 服务。
@@ -56,11 +56,7 @@ SERVICER_SAVE_PATH
 SCAN_FILE_BACK_PATH
 SERVER_HOST
 SERVER_PORT
-DB_USER
-DB_PASSWORD
-DB_HOST
-DB_PORT
-DB_NAME
+LOCAL_DB_PATH
 ```
 
 注意：
@@ -128,22 +124,17 @@ src/core/db.py
 使用：
 
 - SQLAlchemy
-- PostgreSQL
-- `psycopg2`
+- SQLite
 - `SessionLocal`
 - `Base = declarative_base()`
 
 数据库环境变量：
 
 ```text
-DB_USER
-DB_PASSWORD
-DB_HOST
-DB_PORT
-DB_NAME
+LOCAL_DB_PATH
 ```
 
-服务层通常通过 `src.core.db.SessionLocal` 直接创建会话，按 CRUD 方式操作模型。
+`LOCAL_DB_PATH` 为空时默认使用项目根目录 `database/digitalSystem.db`。服务层通常通过 `src.core.db.SessionLocal` 直接创建会话，按 CRUD 方式操作模型。
 
 ## ORM 模型
 
@@ -378,7 +369,7 @@ requirements.txt
 
 - GUI：`PySide6`、`PySide6-Fluent-Widgets`、`PySideSix-Frameless-Window`
 - API：`fastapi`、`uvicorn`、`python-multipart` 相关依赖
-- 数据库：`SQLAlchemy`、`psycopg2`、`psycopg2-binary`
+- 数据库：`SQLAlchemy`、Python 标准库 `sqlite3`
 - OCR/图像：`paddleocr`、`paddlepaddle`、`opencv-contrib-python`、`Pillow`、`reportlab`、`pypdfium2`
 - 数据处理：`pandas`、`openpyxl`、`numpy`
 - 扫描：`pytwain`

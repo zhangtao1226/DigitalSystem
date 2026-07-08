@@ -15,12 +15,15 @@ DATA_DIRS = [
 
 DATA_FILES = [
     (".env", ".env"),
+    ("public.sql", "public.sql"),
+    ("app.ico", "app.ico"),
     ("placeholder.jpg", "placeholder.jpg"),
     ("src/core/scan_config.json", "src/core/scan_config.json"),
     ("src/core/档案模版.xlsx", "src/core/档案模版.xlsx"),
 ]
 
 RUNTIME_DIRS = [
+    "database",
     "download_images",
     "scan_file_back",
     "upload_images",
