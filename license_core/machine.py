@@ -274,10 +274,6 @@ def build_machine_code(info: Dict[str, str]) -> str:
 
 def get_machine_code() -> str:
     """Generate the final machine code.
-
-    The first generated value is cached in the writable app data directory so
-    the registration code shown to users stays stable even if Windows returns a
-    volatile disk or network-adapter value during a later startup.
     """
     cached_code = read_cached_machine_code()
     if cached_code:
