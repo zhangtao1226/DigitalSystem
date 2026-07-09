@@ -4,7 +4,7 @@
 # @Desc      : 系统管理主窗口
 # @Time      : 2025/12/05
 # @Software  : PyCharm
-import sys
+import importlib
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QVBoxLayout, QHBoxLayout, QLabel, QWidget,QStackedWidget
@@ -17,26 +17,60 @@ from qfluentwidgets import (
 from qframelesswindow import FramelessWindow, StandardTitleBar
 
 from src.core.cache_manager import global_cache
-from src.view.system.home_page import HomePage
-from src.view.system.about_page import AboutPage
-from src.view.system.role_manage_page import RoleManagePage
-from src.view.system.user_manage_page import UserManagePage
-from src.view.system.ocr_datasets_page import OcrDatasetsPage
-from src.view.system.define_template_page import DefineTemplatePage
-from src.view.system.workflow_config_page import WorkflowConfiguration
-from src.view.system.archival_mange_page import ArchiveCategoryPage
-from src.view.system.import_directory_page import ImportDirectoryPage
-from src.view.system.mark_manage_page import MarkManagePage
-from src.view.system.archive_stamp_template_page import ArchiveStampTemplatePage
-
-
 # 主窗口
 class SystemMainWindow(FramelessWindow):
+    PAGE_SPECS = {
+        "user": (
+            "src.view.system.user_manage_page",
+            "UserManagePage",
+            "user_manage_page",
+            "用户管理",
+        ),
+        "role": (
+            "src.view.system.role_manage_page",
+            "RoleManagePage",
+            "role_manage_page",
+            "角色管理",
+        ),
+        "archival": (
+            "src.view.system.archival_mange_page",
+            "ArchiveCategoryPage",
+            "archival_manage_page",
+            "档案门类",
+        ),
+        "workConfig": (
+            "src.view.system.workflow_config_page",
+            "WorkflowConfiguration",
+            "work_config_page",
+            "工作流配置",
+        ),
+        "archiveStamp": (
+            "src.view.system.archive_stamp_template_page",
+            "ArchiveStampTemplatePage",
+            "archive_stamp_page",
+            "归档章模板",
+        ),
+        "importDirectory": (
+            "src.view.system.import_directory_page",
+            "ImportDirectoryPage",
+            "import_directory_page",
+            "目录导入与管理",
+        ),
+        "markManage": (
+            "src.view.system.mark_manage_page",
+            "MarkManagePage",
+            "mark_manage_page",
+            "质检标记管理",
+        ),
+    }
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("数字化加工系统 - 系统管理")
         # self.resize(1200, 800)
         # self.center()
+        self._pages = {}
+        self._requested_page = None
         self.init_ui()
 
     def center(self):
@@ -110,32 +144,19 @@ class SystemMainWindow(FramelessWindow):
             }
         """)
 
-        # 创建各个页面
-        # self.home_page = HomePage()
-        self.user_manage_page = UserManagePage()
-        self.role_manage_page = RoleManagePage()
-        self.archival_manage_page = ArchiveCategoryPage()
-        self.work_config_page = WorkflowConfiguration()
-        self.define_template_page = DefineTemplatePage()
-        self.ocr_datasets_page = OcrDatasetsPage()
-        self.archive_stamp_page = ArchiveStampTemplatePage()
-        self.import_directory_page = ImportDirectoryPage()
-        self.mark_manage_page = MarkManagePage()
-        self.about_page = AboutPage()
-
-        # 添加页面到堆栈
-        # self.stacked_widget.addWidget(self.home_page)
-        self.stacked_widget.addWidget(self.user_manage_page)
-        self.stacked_widget.addWidget(self.role_manage_page)
-        self.stacked_widget.addWidget(self.archival_manage_page)
-        self.stacked_widget.addWidget(self.work_config_page)
-        self.stacked_widget.addWidget(self.define_template_page)
-        self.stacked_widget.addWidget(self.ocr_datasets_page)
-        self.stacked_widget.addWidget(self.archive_stamp_page)
-        self.stacked_widget.addWidget(self.import_directory_page)
-        self.stacked_widget.addWidget(self.mark_manage_page)
-
-        self.stacked_widget.addWidget(self.about_page)
+        # 先显示轻量占位页。业务页面在首次访问时才导入和创建，
+        # 避免打开系统管理前同步初始化所有页面及其数据库查询。
+        self.loading_page = QWidget()
+        loading_layout = QVBoxLayout(self.loading_page)
+        loading_layout.addStretch()
+        self.loading_label = QLabel("正在进入系统管理…")
+        self.loading_label.setAlignment(Qt.AlignCenter)
+        self.loading_label.setStyleSheet(
+            "color: #666666; font-size: 16px; font-family: 'Microsoft YaHei';"
+        )
+        loading_layout.addWidget(self.loading_label)
+        loading_layout.addStretch()
+        self.stacked_widget.addWidget(self.loading_page)
         self.content_layout.addWidget(self.stacked_widget)
 
         # 添加导航项
@@ -147,8 +168,8 @@ class SystemMainWindow(FramelessWindow):
 
         self.setLayout(main_layout)
 
-        # 默认显示主页面
-        # self.switch_page("home")
+        # 等窗口先完成 show/paint，再加载默认页，点击后可立即看到界面。
+        QTimer.singleShot(50, lambda: self.switch_page("user"))
 
     def create_top_bar(self) -> QWidget:
         """创建顶部栏"""
@@ -166,7 +187,7 @@ class SystemMainWindow(FramelessWindow):
         top_layout.setSpacing(20)
 
         # 页面标题
-        self.page_title_label = StrongBodyLabel("主页面")
+        self.page_title_label = StrongBodyLabel("系统管理")
         self.page_title_label.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
         self.page_title_label.setStyleSheet("color: #333333;")
         top_layout.addWidget(self.page_title_label)
@@ -324,36 +345,43 @@ class SystemMainWindow(FramelessWindow):
 
     def switch_page(self, page_name: str):
         """切换页面"""
-        page_titles = {
-            "home": "主页面",
-            "user": "用户管理",
-            "role": "角色管理",
-            "archival": "档案门类",
-            "workConfig": "工作流配置",
-            "archiveStamp": "归档章模板",
-            "importDirectory": "目录导入与管理",
-            "markManage": "质检标记管理",
-            "defineTemplate": "定义模板",
-            "about": "关于系统"
-        }
+        spec = self.PAGE_SPECS.get(page_name)
+        if spec is None:
+            return
 
-        page_widgets = {
-            # "home": self.home_page,
-            "user": self.user_manage_page,
-            "role": self.role_manage_page,
-            "archival": self.archival_manage_page,
-            "workConfig": self.work_config_page,
-            "archiveStamp": self.archive_stamp_page,
-            "importDirectory": self.import_directory_page,
-            "markManage": self.mark_manage_page,
-            "defineTemplate": self.define_template_page,
-            # "about": self.about_page
-        }
+        self._requested_page = page_name
+        self.page_title_label.setText(spec[3])
+        self.navigation_interface.setCurrentItem(page_name)
 
-        if page_name in page_widgets:
-            self.stacked_widget.setCurrentWidget(page_widgets[page_name])
-            self.page_title_label.setText(page_titles[page_name])
-            self.navigation_interface.setCurrentItem(page_name)
+        page = self._pages.get(page_name)
+        if page is not None:
+            self.stacked_widget.setCurrentWidget(page)
+            return
+
+        self.loading_label.setText(f"正在加载{spec[3]}…")
+        self.stacked_widget.setCurrentWidget(self.loading_page)
+        QTimer.singleShot(0, lambda route=page_name: self._create_page(route))
+
+    def _create_page(self, page_name: str):
+        """首次访问时导入并创建页面，之后直接复用。"""
+        if page_name != self._requested_page or page_name in self._pages:
+            return
+
+        module_name, class_name, attribute_name, title = self.PAGE_SPECS[page_name]
+        try:
+            module = importlib.import_module(module_name)
+            page_class = getattr(module, class_name)
+            page = page_class()
+        except Exception as exc:
+            self.loading_label.setText(f"{title}加载失败：{exc}")
+            return
+
+        self._pages[page_name] = page
+        setattr(self, attribute_name, page)
+        self.stacked_widget.addWidget(page)
+
+        if page_name == self._requested_page:
+            self.stacked_widget.setCurrentWidget(page)
 
     def exit_system(self):
         """退出系统"""

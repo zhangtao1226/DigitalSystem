@@ -636,7 +636,8 @@ class MainWindow(FramelessWindow):
         self._is_navigation = True
         if global_cache.get("current_user", None) is not None:
             from src.view.system.system_main import SystemMainWindow
-            SystemMainWindow().showFullScreen()
+            self.system_main_window = SystemMainWindow()
+            self.system_main_window.showFullScreen()
             QTimer.singleShot(100, self.close)
         else:
             show_warning(self, "警告", "登录超时, 请退出后重新登录!")
