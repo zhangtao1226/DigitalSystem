@@ -7,15 +7,16 @@
 
 import os
 import re
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.sql.sqltypes import Boolean
+from sqlalchemy.orm import Session as OrmSession, sessionmaker
+from sqlalchemy.sql.sqltypes import Boolean, DateTime
 
 
 # 加载项目根目录 .env 文件中的数据库配置
@@ -74,6 +75,50 @@ def _create_database_engine():
 engine = _create_database_engine()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+def _coerce_datetime_value(value):
+    if value is None or isinstance(value, (datetime, date)):
+        return value
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d",
+        ):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+
+    return value
+
+
+@event.listens_for(OrmSession, "before_flush")
+def _coerce_model_datetime_columns(session, flush_context, instances):
+    for obj in tuple(session.new) + tuple(session.dirty):
+        mapper = getattr(obj, "__mapper__", None)
+        if mapper is None:
+            continue
+
+        for column in mapper.columns:
+            if not isinstance(column.type, DateTime):
+                continue
+
+            value = getattr(obj, column.key, None)
+            coerced_value = _coerce_datetime_value(value)
+            if coerced_value is not value:
+                setattr(obj, column.key, coerced_value)
 
 
 def check_database_connection() -> bool:
