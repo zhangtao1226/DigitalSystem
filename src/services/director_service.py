@@ -4,16 +4,17 @@
 # @Desc      : 
 # @Time      : 2026/2/26 14:02
 # @Software  : PyCharm
-from multiprocessing.util import is_exiting
-
-from paddle.base.libpaddle.eager.ops.legacy import pir_run_program
 from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from sympy.polys.polyconfig import query
-from sqlalchemy import asc, desc, func
+from sqlalchemy import text
 
-from src.core.db import SessionLocal
+from src.core.db import (
+    SessionLocal,
+    build_fts5_query,
+    can_use_fts5,
+    fetch_page,
+)
 from src.models.director_model import DirectorModel as Director
 
 class DirectorService:
@@ -114,6 +115,41 @@ class DirectorService:
     def get_dir_info(self, where: Dict[str, Any]) -> List[Director]:
         return self.db.query(Director).filter_by(**where).all()
 
+    @staticmethod
+    def _apply_search_filters(query, title: str = None, doc_number: str = None):
+        if title:
+            if can_use_fts5("director_fts", title):
+                query = query.filter(
+                    text(
+                        "director.id IN ("
+                        "SELECT rowid FROM director_fts "
+                        "WHERE director_fts MATCH :director_title_fts"
+                        ")"
+                    )
+                ).params(
+                    director_title_fts=f"title : {build_fts5_query(title)}"
+                )
+            else:
+                query = query.filter(Director.title.like(f"%{title}%"))
+
+        if doc_number:
+            if can_use_fts5("director_fts", doc_number):
+                query = query.filter(
+                    text(
+                        "director.id IN ("
+                        "SELECT rowid FROM director_fts "
+                        "WHERE director_fts MATCH :director_doc_number_fts"
+                        ")"
+                    )
+                ).params(
+                    director_doc_number_fts=(
+                        f"doc_number : {build_fts5_query(doc_number)}"
+                    )
+                )
+            else:
+                query = query.filter(Director.doc_number.like(f"%{doc_number}%"))
+        return query
+
     def get_total(self, archive_type:str = None, category: str = None, title:str = None, doc_number:str = None) -> Optional[int]:
         query = self.db.query(Director)
 
@@ -123,12 +159,7 @@ class DirectorService:
         if category:
             query = query.filter(Director.category == category)
 
-        if title:
-            query = query.filter(Director.title.like(f"%{title}%"))
-
-        if doc_number:
-            query = query.filter(Director.doc_number.like(f"%{doc_number}%"))
-
+        query = self._apply_search_filters(query, title, doc_number)
         return query.count()
 
     def get_list(self,
@@ -155,13 +186,13 @@ class DirectorService:
             query = query.filter(Director.archive_type == archive_type)
         if category:
             query = query.filter(Director.category == category)
-        if title:
-            query = query.filter(Director.title.like(f"%{title}%"))
-        if doc_number:
-            query = query.filter(Director.doc_number.like(f"%{doc_number}%"))
-
-        else:
-           query = query.order_by(Director.id.desc())
-        return query.offset(skip).limit(limit).all()
+        query = self._apply_search_filters(query, title, doc_number)
+        return fetch_page(
+            query,
+            Director,
+            (Director.id.desc(),),
+            skip,
+            limit,
+        )
 
 director_service = DirectorService()

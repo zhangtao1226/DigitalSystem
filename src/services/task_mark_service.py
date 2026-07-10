@@ -7,8 +7,13 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import asc, desc, func, or_
-from src.core.db import SessionLocal
+from sqlalchemy import asc, desc, func, or_, text
+from src.core.db import (
+    SessionLocal,
+    build_fts5_query,
+    can_use_fts5,
+    fetch_page,
+)
 from src.models.task_mark_model import TaskMark
 
 
@@ -51,9 +56,7 @@ class TaskMarkService:
                 level=data.get("level", "一般"),
                 description=data.get("description", ""),
                 inspector=data["inspector"],
-                mark_date=data.get(
-                    "mark_date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                ),
+                mark_date=data.get("mark_date", datetime.now()),
                 # 可选
                 scan_file=data.get("scan_file"),
                 field_name=data.get("field_name"),
@@ -86,9 +89,7 @@ class TaskMarkService:
                     level=data.get("level", "一般"),
                     description=data.get("description", ""),
                     inspector=data["inspector"],
-                    mark_date=data.get(
-                        "mark_date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    ),
+                    mark_date=data.get("mark_date", datetime.now()),
                     scan_file=data.get("scan_file"),
                     page_no=data.get("page_no"),
                     field_name=data.get("field_name"),
@@ -243,16 +244,26 @@ class TaskMarkService:
             q = q.filter(TaskMark.is_fixed == is_fixed)
 
         if keyword:
-            kw = f"%{keyword}%"
-            q = q.filter(
-                or_(
-                    TaskMark.mark_type.like(kw),
-                    TaskMark.description.like(kw),
-                    TaskMark.scan_file.like(kw),
-                    TaskMark.inspector.like(kw),
-                    TaskMark.field_name.like(kw),
+            if can_use_fts5("task_mark_fts", keyword):
+                q = q.filter(
+                    text(
+                        "task_mark.id IN ("
+                        "SELECT rowid FROM task_mark_fts "
+                        "WHERE task_mark_fts MATCH :task_mark_fts_query"
+                        ")"
+                    )
+                ).params(task_mark_fts_query=build_fts5_query(keyword))
+            else:
+                kw = f"%{keyword}%"
+                q = q.filter(
+                    or_(
+                        TaskMark.mark_type.like(kw),
+                        TaskMark.description.like(kw),
+                        TaskMark.scan_file.like(kw),
+                        TaskMark.inspector.like(kw),
+                        TaskMark.field_name.like(kw),
+                    )
                 )
-            )
 
         col_map = {
             "mark_date": TaskMark.mark_date,
@@ -261,11 +272,13 @@ class TaskMarkService:
             "id": TaskMark.id,
         }
         col = col_map.get(order_by, TaskMark.mark_date)
-        q = q.order_by(asc(col) if order_dir == "asc" else desc(col))
-
         total = q.count()
         offset = (page - 1) * page_size
-        items = q.offset(offset).limit(page_size).all()
+        direction = asc if order_dir == "asc" else desc
+        order_columns = (direction(col),)
+        if col is not TaskMark.id:
+            order_columns += (direction(TaskMark.id),)
+        items = fetch_page(q, TaskMark, order_columns, offset, page_size)
         return items, total
 
     def update_mark(self, mark_id: int, data: Dict[str, Any]) -> Optional[TaskMark]:
@@ -301,9 +314,7 @@ class TaskMarkService:
             return None
         try:
             mark.is_fixed = True
-            mark.fix_date = (fix_data or {}).get(
-                "fix_date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
+            mark.fix_date = (fix_data or {}).get("fix_date", datetime.now())
             mark.fix_remark = (fix_data or {}).get("fix_remark", "")
             if fix_data and "field_value_after" in fix_data:
                 mark.field_value_after = fix_data["field_value_after"]
@@ -323,7 +334,7 @@ class TaskMarkService:
 
         if not mark_ids:
             return 0
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
         remark = fix_remark or (
             f"批量确认修改完成（操作人：{operator}）"
             if operator

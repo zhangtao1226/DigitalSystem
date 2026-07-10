@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any, Union
 from sqlalchemy import func
 from sqlalchemy.orm import Query
 
-from src.core.db import SessionLocal
+from src.core.db import SessionLocal, fetch_page
 from src.models.operation import Operation
 
 class OperationService:
@@ -81,7 +81,13 @@ class OperationService:
         #     query = query.filter(Operation.operator_date == operator_date)
 
         query = query.filter(Operation.task_id > 0)
-        return query.order_by(Operation.operator).offset(skip).limit(limit).all()
+        return fetch_page(
+            query,
+            Operation,
+            (Operation.operator.asc(), Operation.id.asc()),
+            skip,
+            limit,
+        )
 
     def get_total_count(self, **filters) -> int:
         query = self.db.query(Operation)

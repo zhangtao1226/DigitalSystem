@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
-from src.core.db import SessionLocal
+from src.core.db import SessionLocal, fetch_page
 from src.models.register import Register
 
 
@@ -140,7 +140,13 @@ class RegisterService:
         if register is not None:
             query = query.filter(Register.register == register)
 
-        return query.order_by(Register.id.desc()).offset(skip).limit(limit).all()
+        return fetch_page(
+            query,
+            Register,
+            (Register.id.desc(),),
+            skip,
+            limit,
+        )
 
     def get_total_count(self, **filters) -> int:
         """
