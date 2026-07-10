@@ -15,11 +15,15 @@ class TaskProgress(Base):
     sub_start = Column(String(50), nullable=False, comment="本次提交起始号")
     sub_end = Column(String(50), nullable=False, comment="本次提交截止号")
     status = Column(Integer, default=0, comment="0：保存；1：提交")
-    operator = Column(String(50), index=True)
-    operate_date = Column(DateTime, index=True)
+    operator = Column(String(50))
+    operate_date = Column(DateTime)
 
 
     task = relationship("Task",)
+
+    __table_args__ = (
+        Index("idx_task_progress_task", "task_id", "status", "operate_date"),
+    )
 
     def __repr__(self):
         return (f"<TaskProgress(id={self.id}, task_id={self.task_id}, sub_start={self.sub_start}, "

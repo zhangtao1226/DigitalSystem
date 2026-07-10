@@ -17,8 +17,8 @@ class Role(Base):
     __tablename__ = "roles"  # 数据库表名
 
     # 字段定义
-    id = Column(Integer, primary_key=True, index=True, comment="角色ID")
-    name = Column(String(50), unique=True, index=True, nullable=False, comment="角色名称（如：管理员、质检员、操作员）")
+    id = Column(Integer, primary_key=True, comment="角色ID")
+    name = Column(String(50), unique=True, nullable=False, comment="角色名称（如：管理员、质检员、操作员）")
     desc = Column(String(200), nullable=True, comment="角色描述")
     is_active = Column(Boolean, default=True, comment="是否激活")
     create_time = Column(DateTime, comment="创建时间")

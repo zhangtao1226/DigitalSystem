@@ -11,13 +11,17 @@ from src.core.db import Base
 class ArchiveStamp(Base):
     __tablename__ = 'archive_stamp'
 
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True, comment="ID")
-    template_name = Column(String(50), index=True, nullable=False, comment="模版名称")
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="ID")
+    template_name = Column(String(50), nullable=False, comment="模版名称")
     template_format = Column(Integer, nullable=False, comment="章格式; 0: 6格章; 1: 8格章")
-    show_field_labels = Column(Integer, index=True, default=1, comment="是否显示字段; 默认:显示; 0: 不显示")
+    show_field_labels = Column(Integer, default=1, comment="是否显示字段; 默认:显示; 0: 不显示")
     fields_json = Column(Text, nullable=False, comment="归档章字段")
-    create_time = Column(DateTime, index=True, comment="创建时间")
-    update_time = Column(DateTime, index=True, comment="更新时间")
+    create_time = Column(DateTime, comment="创建时间")
+    update_time = Column(DateTime, comment="更新时间")
+
+    __table_args__ = (
+        Index("idx_archive_stamp_name", "template_name"),
+    )
     operator = Column(String(30), nullable=False, comment="创建者")
 
     def __repr__(self):

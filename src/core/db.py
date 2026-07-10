@@ -7,9 +7,11 @@
 
 import os
 import re
+import sqlite3
+import threading
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, event, text
@@ -22,11 +24,15 @@ from sqlalchemy.sql.sqltypes import Boolean, DateTime
 # 加载项目根目录 .env 文件中的数据库配置
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
-load_dotenv(ENV_PATH, override=True)
+load_dotenv(ENV_PATH, override=False)
 
 DATABASE_INIT_SQL_ENV = "DATABASE_INIT_SQL_PATH"
 DATABASE_INIT_SQL_PATH = PROJECT_ROOT / "public.sql"
 DEFAULT_LOCAL_DB_PATH = PROJECT_ROOT / "database" / "digitalSystem.db"
+SQLITE_SCHEMA_VERSION = 2
+SQLITE_BUSY_TIMEOUT_MS = 15_000
+SQLITE_CACHE_SIZE_KIB = 32 * 1024
+DEEP_PAGE_THRESHOLD = 1_000
 
 REQUIRED_DATABASE_TABLES = (
     "users",
@@ -42,6 +48,109 @@ SEED_TABLE_ORDER = (
     "user_role_association",
     "role_permission_association",
 )
+
+MANAGED_INDEXES = {
+    "archive_stamp": {
+        "idx_archive_stamp_name": ("template_name",),
+    },
+    "define_template": {
+        "idx_define_template_name": ("template_name",),
+    },
+    "director": {
+        "idx_director_register": ("register_id", "id"),
+        "idx_director_filter": ("archive_type", "category", "id DESC"),
+        "idx_director_identity": ("doc_number", "archive_type", "category", "title"),
+    },
+    "operation": {
+        "idx_operation_operator_list": ("operator", "id"),
+        "idx_operation_task_date": ("task_id", "operator_date"),
+        "idx_operation_work_list": ("task_name", "operator", "status", "id"),
+    },
+    "register": {
+        "idx_register_batch": ("batch_number",),
+        "idx_register_distribute_list": ("is_distribute", "id DESC"),
+        "idx_register_owner_list": ("register", "id DESC"),
+        "idx_register_filter": (
+            "archive_type",
+            "category",
+            "is_distribute",
+            "status",
+            "task_node",
+            "id DESC",
+        ),
+    },
+    "register_question": {
+        "idx_register_question_register": ("register_id",),
+        "idx_register_question_volume": ("register_id", "volume_number", "recorder"),
+        "idx_register_question_range": ("batch_number", "number_start", "number_end"),
+    },
+    "roles": {},
+    "scan": {
+        "idx_scan_task": ("task_id",),
+        "idx_scan_register": ("register_id",),
+        "idx_scan_dir_name": ("dir_name",),
+    },
+    "scan_images": {
+        "idx_scan_images_order": ("scan_id", "page_index", "file_name"),
+    },
+    "submit_record": {
+        "idx_submit_record_register": ("register_id",),
+        "idx_submit_record_task": ("task_id",),
+        "idx_submit_record_operator_date": ("operator", "operator_date"),
+    },
+    "task": {
+        "idx_task_domain_id": ("task_id",),
+        "idx_task_operator_list": ("task_name", "operator", "id DESC", "task_node"),
+        "idx_task_register_segment": ("register_id", "task_number_start", "id"),
+        "idx_task_batch_flow": ("batch_number", "register_id", "task_node", "status"),
+        "idx_task_range": (
+            "batch_number",
+            "task_node",
+            "task_number_start",
+            "task_number_end",
+        ),
+    },
+    "task_mark": {
+        "idx_task_mark_history": ("task_id", "is_deleted", "mark_date DESC", "id"),
+        "idx_task_mark_status": ("task_id", "is_deleted", "is_fixed", "mark_stage"),
+        "idx_task_mark_batch": (
+            "batch_number",
+            "task_node",
+            "mark_stage",
+            "is_deleted",
+            "mark_date DESC",
+        ),
+    },
+    "task_progress": {
+        "idx_task_progress_task": ("task_id", "status", "operate_date"),
+    },
+    "users": {},
+    "user_role_association": {
+        "idx_user_role_by_role": ("role_id", "user_id"),
+    },
+    "workflows": {},
+}
+
+FTS_DEFINITIONS = {
+    "director_fts": {
+        "content_table": "director",
+        "columns": ("title", "doc_number"),
+    },
+    "task_mark_fts": {
+        "content_table": "task_mark",
+        "columns": (
+            "mark_type",
+            "description",
+            "scan_file",
+            "inspector",
+            "field_name",
+        ),
+    },
+}
+
+_initialization_lock = threading.Lock()
+_database_initialized = False
+_fts5_available = False
 
 
 def _resolve_local_db_path() -> Path:
@@ -68,11 +177,29 @@ def _create_database_engine():
     return create_engine(
         SQLALCHEMY_DATABASE_URL,
         echo=False,
-        connect_args={"check_same_thread": False},
+        connect_args={
+            "check_same_thread": False,
+            "timeout": SQLITE_BUSY_TIMEOUT_MS / 1000,
+        },
     )
 
 
 engine = _create_database_engine()
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_connection_pragmas(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_SIZE_KIB}")
+    finally:
+        cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -146,6 +273,249 @@ def ensure_database_exists() -> bool:
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
     return not existed
+
+
+def backup_database(backup_dir: Optional[Path] = None) -> Path:
+    """使用 SQLite Backup API 创建一致性备份。"""
+    _ensure_sqlite_parent_dir()
+    target_dir = backup_dir or LOCAL_DB_PATH.parent / "backups"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target_path = target_dir / f"{LOCAL_DB_PATH.stem}_{timestamp}.db"
+
+    source = sqlite3.connect(str(LOCAL_DB_PATH))
+    destination = sqlite3.connect(str(target_path))
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    return target_path
+
+
+def _configure_database_file() -> None:
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        connection.exec_driver_sql("PRAGMA wal_autocheckpoint=1000")
+
+
+def _quote_identifier(identifier: str) -> str:
+    return f'"{identifier.replace(chr(34), chr(34) * 2)}"'
+
+
+def _create_index_sql(index_name: str, table_name: str, columns: Sequence[str]) -> str:
+    column_sql = ", ".join(
+        " ".join(
+            [_quote_identifier(parts[0]), *parts[1:]]
+        )
+        for column in columns
+        for parts in [column.split()]
+    )
+    return (
+        f"CREATE INDEX IF NOT EXISTS {_quote_identifier(index_name)} "
+        f"ON {_quote_identifier(table_name)} ({column_sql})"
+    )
+
+
+def _reconcile_managed_indexes() -> None:
+    managed_tables = tuple(MANAGED_INDEXES)
+    table_placeholders = ", ".join(f":table_{index}" for index in range(len(managed_tables)))
+    parameters = {
+        f"table_{index}": table_name
+        for index, table_name in enumerate(managed_tables)
+    }
+
+    with engine.begin() as connection:
+        existing_indexes = connection.execute(
+            text(
+                f"""
+                SELECT name
+                FROM sqlite_schema
+                WHERE type = 'index'
+                  AND sql IS NOT NULL
+                  AND tbl_name IN ({table_placeholders})
+                """
+            ),
+            parameters,
+        ).scalars().all()
+
+        for index_name in existing_indexes:
+            connection.exec_driver_sql(
+                f"DROP INDEX IF EXISTS {_quote_identifier(index_name)}"
+            )
+
+        for table_name, indexes in MANAGED_INDEXES.items():
+            for index_name, columns in indexes.items():
+                connection.exec_driver_sql(
+                    _create_index_sql(index_name, table_name, columns)
+                )
+
+
+def _fts_trigger_sql(
+        fts_table: str,
+        content_table: str,
+        columns: Sequence[str],
+) -> tuple[str, ...]:
+    quoted_columns = ", ".join(_quote_identifier(column) for column in columns)
+    new_values = ", ".join(f"new.{_quote_identifier(column)}" for column in columns)
+    old_values = ", ".join(f"old.{_quote_identifier(column)}" for column in columns)
+    insert_columns = f"rowid, {quoted_columns}"
+    delete_columns = f"{_quote_identifier(fts_table)}, rowid, {quoted_columns}"
+    quoted_fts = _quote_identifier(fts_table)
+    quoted_content = _quote_identifier(content_table)
+
+    return (
+        f"""
+        CREATE TRIGGER IF NOT EXISTS {_quote_identifier(f'{content_table}_fts_ai')}
+        AFTER INSERT ON {quoted_content} BEGIN
+            INSERT INTO {quoted_fts} ({insert_columns})
+            VALUES (new.id, {new_values});
+        END
+        """,
+        f"""
+        CREATE TRIGGER IF NOT EXISTS {_quote_identifier(f'{content_table}_fts_ad')}
+        AFTER DELETE ON {quoted_content} BEGIN
+            INSERT INTO {quoted_fts} ({delete_columns})
+            VALUES ('delete', old.id, {old_values});
+        END
+        """,
+        f"""
+        CREATE TRIGGER IF NOT EXISTS {_quote_identifier(f'{content_table}_fts_au')}
+        AFTER UPDATE ON {quoted_content} BEGIN
+            INSERT INTO {quoted_fts} ({delete_columns})
+            VALUES ('delete', old.id, {old_values});
+            INSERT INTO {quoted_fts} ({insert_columns})
+            VALUES (new.id, {new_values});
+        END
+        """,
+    )
+
+
+def _ensure_fts5_tables() -> bool:
+    global _fts5_available
+
+    try:
+        with engine.begin() as connection:
+            for fts_table, definition in FTS_DEFINITIONS.items():
+                content_table = definition["content_table"]
+                columns = definition["columns"]
+                existed = connection.execute(
+                    text(
+                        """
+                        SELECT 1
+                        FROM sqlite_schema
+                        WHERE type = 'table' AND name = :table_name
+                        """
+                    ),
+                    {"table_name": fts_table},
+                ).first() is not None
+
+                column_sql = ", ".join(_quote_identifier(column) for column in columns)
+                connection.exec_driver_sql(
+                    f"""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS {_quote_identifier(fts_table)}
+                    USING fts5(
+                        {column_sql},
+                        content={_quote_identifier(content_table)},
+                        content_rowid='id',
+                        tokenize='trigram'
+                    )
+                    """
+                )
+
+                for trigger_sql in _fts_trigger_sql(
+                    fts_table,
+                    content_table,
+                    columns,
+                ):
+                    connection.exec_driver_sql(trigger_sql)
+
+                if not existed:
+                    connection.exec_driver_sql(
+                        f"INSERT INTO {_quote_identifier(fts_table)} "
+                        f"({_quote_identifier(fts_table)}) VALUES ('rebuild')"
+                    )
+        _fts5_available = True
+    except (SQLAlchemyError, sqlite3.DatabaseError):
+        _fts5_available = False
+
+    return _fts5_available
+
+
+def can_use_fts5(fts_table: str, keyword: Optional[str]) -> bool:
+    """Trigram 至少需要 3 个字符；短关键词继续使用 LIKE。"""
+    return (
+        _fts5_available
+        and fts_table in FTS_DEFINITIONS
+        and keyword is not None
+        and len(keyword.strip()) >= 3
+    )
+
+
+def build_fts5_query(keyword: str) -> str:
+    return f'"{keyword.strip().replace(chr(34), chr(34) * 2)}"'
+
+
+def fetch_page(
+    query,
+    model,
+    order_columns: Sequence,
+    skip: int,
+    limit: int,
+):
+    """
+    小页直接分页；深页先从索引中获取主键，再关联业务表。
+
+    保留原有 skip/limit 接口，避免页面层大范围改动。
+    """
+    skip = max(int(skip or 0), 0)
+    limit = max(int(limit or 0), 0)
+    ordered_query = query.order_by(None).order_by(*order_columns)
+    if limit == 0:
+        return []
+    if skip < DEEP_PAGE_THRESHOLD:
+        return ordered_query.offset(skip).limit(limit).all()
+
+    page_ids = (
+        query.order_by(None)
+        .with_entities(model.id.label("_page_id"))
+        .order_by(*order_columns)
+        .offset(skip)
+        .limit(limit)
+        .subquery()
+    )
+    return (
+        query.session.query(model)
+        .join(page_ids, model.id == page_ids.c._page_id)
+        .order_by(*order_columns)
+        .all()
+    )
+
+
+def optimize_database() -> None:
+    """执行适合启动阶段的轻量统计与 WAL 维护。"""
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA optimize")
+        connection.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)")
+
+
+def _migrate_database_schema(had_tables: bool) -> bool:
+    with engine.connect() as connection:
+        current_version = int(
+            connection.exec_driver_sql("PRAGMA user_version").scalar() or 0
+        )
+
+    if current_version >= SQLITE_SCHEMA_VERSION:
+        return False
+
+    if had_tables and LOCAL_DB_PATH.exists():
+        backup_database()
+
+    _reconcile_managed_indexes()
+    with engine.begin() as connection:
+        connection.exec_driver_sql(f"PRAGMA user_version={SQLITE_SCHEMA_VERSION}")
+        connection.exec_driver_sql("ANALYZE")
+    return True
 
 
 def _core_tables_exist() -> bool:
@@ -333,15 +703,26 @@ def initialize_database_tables(sql_path: Optional[str] = None) -> bool:
     表结构由 SQLAlchemy 模型创建；基础用户、角色、工作流等数据从 public.sql 导入。
     返回 True 表示本次创建了表或导入了种子数据。
     """
-    _ensure_sqlite_parent_dir()
+    global _database_initialized
 
-    # 导入模型模块后，Base.metadata 才包含完整表结构。
-    import src.models  # noqa: F401
+    with _initialization_lock:
+        if _database_initialized:
+            return False
 
-    had_tables = _core_tables_exist()
-    Base.metadata.create_all(bind=engine)
-    seeded = _seed_database_from_public_sql(sql_path)
-    return (not had_tables) or seeded
+        _ensure_sqlite_parent_dir()
+        _configure_database_file()
+
+        # 导入模型模块后，Base.metadata 才包含完整表结构。
+        import src.models  # noqa: F401
+
+        had_tables = _core_tables_exist()
+        Base.metadata.create_all(bind=engine)
+        seeded = _seed_database_from_public_sql(sql_path)
+        migrated = _migrate_database_schema(had_tables)
+        _ensure_fts5_tables()
+        optimize_database()
+        _database_initialized = True
+        return (not had_tables) or seeded or migrated
 
 
 def get_db():

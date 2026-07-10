@@ -17,10 +17,10 @@ class Workflow(Base):
 
     # 字段定义
 
-    id = Column(Integer, primary_key=True, index=True, nullable=False, comment="工作流索引")
-    work_name = Column(String(25), unique=True, index=True, nullable=False, comment="工作流名称")
+    id = Column(Integer, primary_key=True, nullable=False, comment="工作流索引")
+    work_name = Column(String(25), unique=True, nullable=False, comment="工作流名称")
     status = Column(Boolean, default=False, comment="是否启用")
-    is_work = Column(Integer, index=True, nullable=False, comment="0: 非工作流; 1:可配的工作流;")
+    is_work = Column(Integer, nullable=False, comment="0: 非工作流; 1:可配的工作流;")
 
     # 多对多关系
     roles = relationship(

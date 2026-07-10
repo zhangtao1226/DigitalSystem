@@ -12,11 +12,15 @@ class DefineTemplate(Base):
     __tablename__ = "define_template"
 
     # 定义字段
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True, comment="ID")
-    template_name = Column(String(50), index=True, nullable=False, comment="模板名称")
-    field_info = Column(String(100), index=True, nullable=False, comment="字段信息（包含坐标）JSON 格式")
-    creator = Column(String(20), index=True, nullable=False, comment="创建者")
-    create_date = Column(DateTime, index=True, comment="创建日期")
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="ID")
+    template_name = Column(String(50), nullable=False, comment="模板名称")
+    field_info = Column(String(100), nullable=False, comment="字段信息（包含坐标）JSON 格式")
+    creator = Column(String(20), nullable=False, comment="创建者")
+    create_date = Column(DateTime, comment="创建日期")
+
+    __table_args__ = (
+        Index("idx_define_template_name", "template_name"),
+    )
 
 
     def __repr__(self):

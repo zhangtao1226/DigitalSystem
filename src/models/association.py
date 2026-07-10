@@ -5,7 +5,7 @@
 # @Time      : 2025/12/1 16:37
 # @Software  : PyCharm
 
-from sqlalchemy import Table, Column, Integer, ForeignKey
+from sqlalchemy import Table, Column, Integer, ForeignKey, Index
 
 from src.core.db import Base
 
@@ -15,4 +15,10 @@ user_role_association = Table(
     Base.metadata,
     Column("user_id", Integer, ForeignKey("users.id"), primary_key=True),
     Column("role_id", Integer, ForeignKey("roles.id"), primary_key=True)
+)
+
+Index(
+    "idx_user_role_by_role",
+    user_role_association.c.role_id,
+    user_role_association.c.user_id,
 )

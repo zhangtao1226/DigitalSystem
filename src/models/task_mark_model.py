@@ -11,11 +11,11 @@ from src.core.db import Base
 class TaskMark(Base):
     __tablename__ = "task_mark"
     id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID")
-    task_id = Column(Integer, ForeignKey("task.id"), nullable=False, index=True, comment="关联任务ID")
-    batch_number = Column(String(50), nullable=False, index=True, comment="批次号")
-    task_node = Column(Integer, nullable=False, index=True, comment="任务节点号")
+    task_id = Column(Integer, ForeignKey("task.id"), nullable=False, comment="关联任务ID")
+    batch_number = Column(String(50), nullable=False, comment="批次号")
+    task_node = Column(Integer, nullable=False, comment="任务节点号")
 
-    mark_stage = Column(Integer, nullable=False, index=True, comment="质检阶段：1=扫描 2=图像处理 3=目录")
+    mark_stage = Column(Integer, nullable=False, comment="质检阶段：1=扫描 2=图像处理 3=目录")
 
     scan_file = Column(String(255), nullable=True, comment="文件件名")
     field_name = Column(String(100), nullable=True, comment="目录字段名, 如： 档号、题名等")
@@ -25,8 +25,8 @@ class TaskMark(Base):
     level = Column(String(10), nullable=False, default="一般", comment="严重程度：严重/一般/轻微")
     description = Column(Text, nullable=True, comment="问题详细描述")
 
-    inspector = Column(String(0), nullable=False, index=True, comment="质检员姓名")
-    mark_date = Column(DateTime, nullable=False, index=True, comment="标记时间")
+    inspector = Column(String(50), nullable=False, comment="质检员姓名")
+    mark_date = Column(DateTime, nullable=False, comment="标记时间")
 
     is_fixed = Column(Boolean, default=False, comment="是否修改完成")
     fix_date = Column(DateTime, nullable=True, comment="修改时间")
@@ -36,6 +36,19 @@ class TaskMark(Base):
     is_deleted = Column(Boolean, default=False, comment="软删除")
 
     task = relationship("Task", back_populates="task_mark")
+
+    __table_args__ = (
+        Index("idx_task_mark_history", "task_id", "is_deleted", mark_date.desc(), "id"),
+        Index("idx_task_mark_status", "task_id", "is_deleted", "is_fixed", "mark_stage"),
+        Index(
+            "idx_task_mark_batch",
+            "batch_number",
+            "task_node",
+            "mark_stage",
+            "is_deleted",
+            mark_date.desc(),
+        ),
+    )
 
     def __repr__(self):
         return (f"<TaskMark(id={self.id}, task_id={self.task_id}, mark_stage={self.mark_stage}, "

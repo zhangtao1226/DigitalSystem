@@ -5,7 +5,7 @@
 # @Time      : 2025/12/2 09:47
 # @Software  : PyCharm
 
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Index
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -15,19 +15,19 @@ class Register(Base):
     __tablename__ = "register"  # 数据库表名
 
     # 字段定义
-    id = Column(Integer, primary_key=True, index=True, comment="ID")
-    archive_type = Column(String(100), index=True, nullable=False, comment="档案类别")
-    category = Column(String(25), index=True, nullable=False, comment="类型")
-    batch_number = Column(String(50), index=True, nullable=False, comment="批次号")
-    number_start = Column(String(50), index=True, nullable=False, comment="开始卷/件号")
-    number_end = Column(String(50), index=True, nullable=False, comment="终止卷/件号")
-    is_question = Column(Boolean, index=True, nullable=False, comment="是否登记问题")
-    is_distribute = Column(Boolean, index=True, nullable=False, comment="是否分配")
-    register = Column(String(100), index=True, nullable=False, comment="登记人")
-    register_date = Column(DateTime, index=True, nullable=False, comment="登记日期")
-    status = Column(Integer, index=True, nullable=False, comment="状态; 0: 保存; 1:提交; 2:完结")
-    task_node = Column(Integer, index=True, nullable=False, comment="任务节点")
-    is_import = Column(Boolean, index=True, nullable=False, comment="导入目录; 0: 未导入; 1: 已导入")
+    id = Column(Integer, primary_key=True, comment="ID")
+    archive_type = Column(String(100), nullable=False, comment="档案类别")
+    category = Column(String(25), nullable=False, comment="类型")
+    batch_number = Column(String(50), nullable=False, comment="批次号")
+    number_start = Column(String(50), nullable=False, comment="开始卷/件号")
+    number_end = Column(String(50), nullable=False, comment="终止卷/件号")
+    is_question = Column(Boolean, nullable=False, comment="是否登记问题")
+    is_distribute = Column(Boolean, nullable=False, comment="是否分配")
+    register = Column(String(100), nullable=False, comment="登记人")
+    register_date = Column(DateTime, nullable=False, comment="登记日期")
+    status = Column(Integer, nullable=False, comment="状态; 0: 保存; 1:提交; 2:完结")
+    task_node = Column(Integer, nullable=False, comment="任务节点")
+    is_import = Column(Boolean, nullable=False, comment="导入目录; 0: 未导入; 1: 已导入")
 
     # 添加问题表一对多关系
     questions = relationship("RegisterQuestion", back_populates="register", cascade="all, delete-orphan")
@@ -36,6 +36,21 @@ class Register(Base):
     tasks = relationship("Task", back_populates="register", cascade="all, delete-orphan")
 
     scans = relationship("Scan", back_populates="register")
+
+    __table_args__ = (
+        Index("idx_register_batch", "batch_number"),
+        Index("idx_register_distribute_list", "is_distribute", id.desc()),
+        Index("idx_register_owner_list", "register", id.desc()),
+        Index(
+            "idx_register_filter",
+            "archive_type",
+            "category",
+            "is_distribute",
+            "status",
+            "task_node",
+            id.desc(),
+        ),
+    )
 
 
     def __repr__(self):

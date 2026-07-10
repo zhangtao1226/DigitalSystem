@@ -12,17 +12,17 @@ class ScanImages(Base):
     __tablename__ = "scan_images"
 
     id = Column(Integer, primary_key=True, autoincrement=True, comment="ID")
-    scan_id = Column(Integer, ForeignKey("scan.id"), nullable=False, index=True, comment="扫描表ID")
+    scan_id = Column(Integer, ForeignKey("scan.id"), nullable=False, comment="扫描表ID")
     file_name = Column(String(20), nullable=False, comment="扫描文件名")
     page_index = Column(Integer, nullable=True, comment="当前页码")
     is_ocr = Column(Boolean,  default=False, comment="是否OCR")
-    create_time = Column(DateTime, index=True, comment="创建时间")
-    operator = Column(String(20), index=True, comment="操作人")
+    create_time = Column(DateTime, comment="创建时间")
+    operator = Column(String(20), comment="操作人")
 
     scan = relationship("Scan", backref="scan_images")
 
     __table_args__ = (
-        Index("idx_scan_id", "scan_id"),
+        Index("idx_scan_images_order", "scan_id", "page_index", "file_name"),
     )
 
     def __repr__(self):

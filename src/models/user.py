@@ -16,13 +16,13 @@ class User(Base):
     __tablename__ = "users"  # 数据库表名
 
     # 字段定义
-    id = Column(Integer, primary_key=True, index=True, comment="用户ID")
-    username = Column(String(50), unique=True, index=True, nullable=False, comment="用户名")
+    id = Column(Integer, primary_key=True, comment="用户ID")
+    username = Column(String(50), unique=True, nullable=False, comment="用户名")
     password = Column(String(255), nullable=False, comment="密码哈希（不存储明文）")
     is_active = Column(Boolean, default=True, comment="是否激活")
-    create_time = Column(DateTime, index=True, comment="创建时间")
-    update_time = Column(DateTime, index=True, comment="更新时间")
-    last_login = Column(DateTime, index=True, comment="最近登录时间")
+    create_time = Column(DateTime, comment="创建时间")
+    update_time = Column(DateTime, comment="更新时间")
+    last_login = Column(DateTime, comment="最近登录时间")
 
     # 多对多关系：用户关联多个角色（通过关联表）
     roles = relationship(
