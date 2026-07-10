@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from sqlalchemy import asc, desc, func
 
-from src.core.db import SessionLocal
+from src.core.db import SessionLocal, fetch_page
 from src.core.settings import settings
 from src.models.task import Task
 from src.services.workflow_service import workflow_service
@@ -122,10 +122,10 @@ class TaskService:
         if batch_number:
             query = query.filter(Task.batch_number == batch_number)
         if order_by:
-            query = query.order_by(Task.task_number_start.asc())
+            order_columns = (Task.task_number_start.asc(), Task.id.asc())
         else:
-           query = query.order_by(Task.id.desc(), Task.task_node.asc())
-        return query.offset(skip).limit(limit).all()
+            order_columns = (Task.id.desc(), Task.task_node.asc())
+        return fetch_page(query, Task, order_columns, skip, limit)
 
     def update(self, task_id: int, update_data: Dict[str, Any]) -> Optional[Task]:
         db_task = self.get_by_id(task_id)
@@ -149,6 +149,114 @@ class TaskService:
                 query = query.filter(getattr(Task, key) == value)
 
         return query.count()
+
+    def _completed_task_query(
+            self,
+            operator: Optional[str] = None,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
+    ):
+        query = self.db.query(Task).filter(
+            Task.status == 1,
+            Task.is_do.is_(True),
+            Task.operator.isnot(None),
+        )
+        if operator:
+            query = query.filter(Task.operator == operator)
+        if start_date:
+            query = query.filter(Task.operator_date >= start_date)
+        if end_date:
+            query = query.filter(Task.operator_date < end_date)
+        return query
+
+    def get_completed_statistics(
+            self,
+            skip: int = 0,
+            limit: int = 100,
+            operator: Optional[str] = None,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        query = (
+            self._completed_task_query(operator=operator, start_date=start_date, end_date=end_date)
+            .with_entities(
+                Task.operator.label("operator"),
+                func.count(func.distinct(Task.batch_number)).label("batch_count"),
+                func.count(Task.id).label("task_count"),
+                func.count(func.distinct(Task.task_name)).label("workflow_count"),
+                func.min(Task.operator_date).label("first_done_at"),
+                func.max(Task.operator_date).label("last_done_at"),
+            )
+            .group_by(Task.operator)
+            .order_by(Task.operator.asc())
+        )
+        rows = query.offset(skip).limit(limit).all()
+        return [row._asdict() for row in rows]
+
+    def get_completed_statistics_count(
+            self,
+            operator: Optional[str] = None,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
+    ) -> int:
+        grouped_query = (
+            self._completed_task_query(operator=operator, start_date=start_date, end_date=end_date)
+            .with_entities(Task.operator)
+            .group_by(Task.operator)
+            .subquery()
+        )
+        return self.db.query(func.count()).select_from(grouped_query).scalar() or 0
+
+    def get_completed_statistics_summary(
+            self,
+            operator: Optional[str] = None,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
+    ) -> Dict[str, int]:
+        row = (
+            self._completed_task_query(operator=operator, start_date=start_date, end_date=end_date)
+            .with_entities(
+                func.count(func.distinct(Task.operator)).label("operator_count"),
+                func.count(func.distinct(Task.batch_number)).label("batch_count"),
+                func.count(Task.id).label("task_count"),
+                func.count(func.distinct(Task.task_name)).label("workflow_count"),
+            )
+            .one()
+        )
+        return {
+            "operator_count": row.operator_count or 0,
+            "batch_count": row.batch_count or 0,
+            "task_count": row.task_count or 0,
+            "workflow_count": row.workflow_count or 0,
+        }
+
+    def get_completed_detail_list(
+            self,
+            skip: int = 0,
+            limit: int = 100,
+            operator: Optional[str] = None,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
+    ) -> List[Task]:
+        return (
+            self._completed_task_query(operator=operator, start_date=start_date, end_date=end_date)
+            .order_by(Task.operator_date.desc(), Task.id.desc())
+            .offset(skip)
+            .limit(limit)
+            .all()
+        )
+
+    def get_completed_detail_count(
+            self,
+            operator: Optional[str] = None,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
+    ) -> int:
+        return self._completed_task_query(
+            operator=operator,
+            start_date=start_date,
+            end_date=end_date,
+        ).count()
 
     def get_last_one(self):
         """

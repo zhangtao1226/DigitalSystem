@@ -5,16 +5,14 @@
 # @Time      : 2025/11/22 11:31
 # @Software  : PyCharm
 
-import os
-import sys
 import time
 
 from dotenv import load_dotenv
-from PySide6.QtGui import QFont, QCursor
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QVBoxLayout, QHBoxLayout, QHeaderView,
                                QLabel, QWidget, QTableWidgetItem,
                                )
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, QTimer
 from qfluentwidgets import (setTheme, Theme, MessageBox, PushButton, PrimaryPushButton,
                             ComboBox, FluentIcon, TableWidget, InfoBar, InfoBarPosition,
                             )
@@ -22,8 +20,7 @@ from qfluentwidgets import (setTheme, Theme, MessageBox, PushButton, PrimaryPush
 from qframelesswindow import FramelessWindow
 
 from src.core.cache_manager import global_cache
-from src.services.register_service import register_service
-from src.services.operation_service import operation_service
+from src.services.task_service import task_service
 from src.utils.NotificationTool import show_warning
 from src.view.common.NavigationLabel import NavigationLabel
 
@@ -92,8 +89,8 @@ class DetailsTableWindow(FramelessWindow):
         separator.setStyleSheet("background-color: #e0e0e0;")
         main_layout.addWidget(separator)
 
+        self.create_summary_section(main_layout)
         self.create_table_section(main_layout)
-        self.load_all_data()  # 加载所有数据
         self.update_table_display()  # 更新表格显示
         self.setLayout(main_layout)
         self.update_user_label()
@@ -112,6 +109,22 @@ class DetailsTableWindow(FramelessWindow):
         task_label = NavigationLabel("统计详情", is_clickable=False)
         parent_layout.addWidget(task_label)
         parent_layout.setContentsMargins(0, 0, 0, 0)
+
+    def create_summary_section(self, parent_layout):
+        self.summary_label = QLabel()
+        self.summary_label.setStyleSheet("font-size: 12px; color: #666; padding: 0 2px;")
+        parent_layout.addWidget(self.summary_label)
+
+    def _get_filter_context(self):
+        data = self.current_data if isinstance(self.current_data, dict) else {}
+        operator = data.get("operator")
+        if not operator and isinstance(self.current_data, (list, tuple)) and len(self.current_data) > 1:
+            operator = self.current_data[1]
+        range_label = data.get("range_label", "全部")
+        start_date = data.get("start_date")
+        end_date = data.get("end_date")
+        period = data.get("period", "")
+        return operator, start_date, end_date, period, range_label
 
     def go_to_home(self):
         self._is_navigation = True
@@ -136,6 +149,8 @@ class DetailsTableWindow(FramelessWindow):
             LoginWindow().showFullScreen()
             QTimer.singleShot(100, self.close)
         else:
+            if isinstance(self.current_data, dict):
+                global_cache.set("statistics_filter_context", self.current_data)
             from src.view.statistics.statistics_table import StatisticsTableWindow
             statistics_table = StatisticsTableWindow()
             statistics_table.showFullScreen()
@@ -147,7 +162,7 @@ class DetailsTableWindow(FramelessWindow):
 
     def create_table(self, parent_layout):
         self.table_widget = TableWidget()
-        headers = ["ID",  "操作内容",  "操作人", "说明", "操作日期"]
+        headers = ["ID", "批次号", "流程", "任务段", "完成段", "操作人", "完成日期"]
         self.table_widget.setColumnCount(len(headers))
         self.table_widget.setHorizontalHeaderLabels(headers)
         header_font = QFont()
@@ -167,11 +182,13 @@ class DetailsTableWindow(FramelessWindow):
 
         from PySide6.QtWidgets import QAbstractItemView
         self.table_widget.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table_widget.setColumnWidth(0, 120)  # ID
-        self.table_widget.setColumnWidth(1, 160)  # 操作内容
-        self.table_widget.setColumnWidth(2, 150)  # 操作人
-        self.table_widget.setColumnWidth(3, 860)  # 说明
-        self.table_widget.setColumnWidth(4, 180)  # 操作日期
+        self.table_widget.setColumnWidth(0, 80)  # ID
+        self.table_widget.setColumnWidth(1, 160)  # 批次号
+        self.table_widget.setColumnWidth(2, 160)  # 流程
+        self.table_widget.setColumnWidth(3, 180)  # 任务段
+        self.table_widget.setColumnWidth(4, 180)  # 完成段
+        self.table_widget.setColumnWidth(5, 150)  # 操作人
+        self.table_widget.setColumnWidth(6, 180)  # 完成日期
         self.table_widget.verticalHeader().setDefaultSectionSize(45)
         parent_layout.addWidget(self.table_widget)
 
@@ -222,13 +239,42 @@ class DetailsTableWindow(FramelessWindow):
 
         self.all_data = []
 
-        all_data = operation_service.get_list(skip=skip, limit=page_size, operator=self.current_data[1])
-        print(f"all_data: {all_data}")
+        operator, start_date, end_date, period, range_label = self._get_filter_context()
+        if not operator:
+            self.total_rows = 0
+            self.summary_label.setText("未选择统计用户")
+            self.calculate_total_pages()
+            return
+
+        all_data = task_service.get_completed_detail_list(
+            skip=skip,
+            limit=page_size,
+            operator=operator,
+            start_date=start_date,
+            end_date=end_date,
+        )
         for item in all_data:
-            item_list = [str(item.id), item.task_name, item.operator, item.operator_remark , item.operator_date.strftime("%Y-%m-%d %H:%M:%S")]
+            task_range = f"{item.task_number_start or ''}-{item.task_number_end or ''}".strip("-")
+            item_list = [
+                str(item.id),
+                item.batch_number or "",
+                item.task_name or "",
+                task_range,
+                item.complete_number or "",
+                item.operator or "",
+                item.operator_date.strftime("%Y-%m-%d %H:%M:%S") if item.operator_date else "",
+            ]
             self.all_data.append(item_list)
 
-            self.total_rows = operation_service.get_total_count(operator=self.current_data[1])
+        self.total_rows = task_service.get_completed_detail_count(
+            operator=operator,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        period_text = f"{period} " if period else ""
+        self.summary_label.setText(
+            f"用户：{operator}  统计范围：{period_text}{range_label}  完成明细：{self.total_rows} 条"
+        )
 
         self.calculate_total_pages()
 
@@ -236,7 +282,7 @@ class DetailsTableWindow(FramelessWindow):
         if self.current_page_size == 0:
             self.total_pages = 1
         else:
-            self.total_pages = (self.total_rows + self.current_page_size - 1) // self.current_page_size
+            self.total_pages = max(1, (self.total_rows + self.current_page_size - 1) // self.current_page_size)
 
         self.page_info_label.setText(f"第 {self.current_page} 页 / 共 {self.total_pages} 页")
 
@@ -247,14 +293,14 @@ class DetailsTableWindow(FramelessWindow):
 
         self.table_widget.setRowCount(0)
 
+        self.load_all_data()
+
         if self.total_rows == 0:
             return
 
-        self.load_all_data()
         current_data = self.all_data
 
         for row, data in enumerate(current_data):
-            print(f"行数据: {data}")
             self.table_widget.insertRow(row)
             for col, value in enumerate(data):
                 item = QTableWidgetItem(value)
@@ -279,7 +325,6 @@ class DetailsTableWindow(FramelessWindow):
             self.update_table_display()
 
     def next_page(self):
-        print(self.current_page, self.total_pages)
         if self.current_page < self.total_pages:
             self.current_page += 1
             self.calculate_total_pages()
