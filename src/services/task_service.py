@@ -158,8 +158,10 @@ class TaskService:
     ):
         query = self.db.query(Task).filter(
             Task.status == 1,
-            Task.is_do.is_(True),
             Task.operator.isnot(None),
+            Task.operator_date.isnot(None),
+            Task.complete_number.isnot(None),
+            func.trim(Task.complete_number) != "",
         )
         if operator:
             query = query.filter(Task.operator == operator)
@@ -168,6 +170,72 @@ class TaskService:
         if end_date:
             query = query.filter(Task.operator_date < end_date)
         return query
+
+    @staticmethod
+    def _append_unique(values: List[str], value: Optional[str]) -> None:
+        value = (value or "").strip()
+        if value and value not in values:
+            values.append(value)
+
+    @staticmethod
+    def get_completed_volume_count(complete_number: Optional[str]) -> int:
+        complete_number = (complete_number or "").strip()
+        if not complete_number:
+            return 0
+
+        for separator in ("-", "~", "～", "—"):
+            if separator in complete_number:
+                number_start, number_end = complete_number.split(separator, 1)
+                break
+        else:
+            return 1
+
+        try:
+            number_start = int(number_start.strip())
+            number_end = int(number_end.strip())
+        except ValueError:
+            return 0
+
+        if number_end < number_start:
+            return 0
+        return number_end - number_start + 1
+
+    @staticmethod
+    def _range_text(number_start: Optional[str], number_end: Optional[str]) -> str:
+        number_start = (number_start or "").strip()
+        number_end = (number_end or "").strip()
+        if number_start and number_end:
+            return f"{number_start}-{number_end}"
+        return number_start or number_end
+
+    @staticmethod
+    def _range_end_value(range_text: Optional[str]) -> Optional[int]:
+        range_text = (range_text or "").strip()
+        if not range_text:
+            return None
+
+        for separator in ("-", "~", "～", "—"):
+            if separator in range_text:
+                _, number_end = range_text.split(separator, 1)
+                break
+        else:
+            number_end = range_text
+
+        try:
+            return int(number_end.strip())
+        except ValueError:
+            return None
+
+    @classmethod
+    def _task_status_text(cls, task: Task) -> str:
+        if task.is_do:
+            return "完成"
+
+        completed_end = cls._range_end_value(task.complete_number)
+        assigned_end = cls._range_end_value(cls._range_text(task.task_number_start, task.task_number_end))
+        if completed_end is not None and assigned_end is not None and completed_end >= assigned_end:
+            return "完成"
+        return "进行中"
 
     def get_completed_statistics(
             self,
@@ -191,7 +259,58 @@ class TaskService:
             .order_by(Task.operator.asc())
         )
         rows = query.offset(skip).limit(limit).all()
-        return [row._asdict() for row in rows]
+        result = [row._asdict() for row in rows]
+        operators = [item["operator"] for item in result if item.get("operator")]
+        if not operators:
+            return result
+
+        detail_rows = (
+            self._completed_task_query(operator=operator, start_date=start_date, end_date=end_date)
+            .filter(Task.operator.in_(operators))
+            .order_by(Task.operator.asc(), Task.operator_date.asc(), Task.id.asc())
+            .all()
+        )
+        detail_map = {
+            operator_name: {
+                "batch_numbers": [],
+                "batch_ranges": [],
+                "assigned_segments": [],
+                "task_statuses": [],
+                "completed_segments": [],
+                "workflow_names": [],
+                "volume_count": 0,
+            }
+            for operator_name in operators
+        }
+        for task in detail_rows:
+            detail = detail_map.setdefault(task.operator, {
+                "batch_numbers": [],
+                "batch_ranges": [],
+                "assigned_segments": [],
+                "task_statuses": [],
+                "completed_segments": [],
+                "workflow_names": [],
+                "volume_count": 0,
+            })
+            self._append_unique(detail["batch_numbers"], task.batch_number)
+            self._append_unique(detail["batch_ranges"], self._range_text(task.number_start, task.number_end))
+            self._append_unique(detail["assigned_segments"], self._range_text(task.task_number_start, task.task_number_end))
+            self._append_unique(detail["task_statuses"], self._task_status_text(task))
+            self._append_unique(detail["completed_segments"], task.complete_number)
+            self._append_unique(detail["workflow_names"], task.task_name)
+            detail["volume_count"] += self.get_completed_volume_count(task.complete_number)
+
+        for item in result:
+            detail = detail_map.get(item["operator"], {})
+            item["batch_numbers"] = "、".join(detail.get("batch_numbers", []))
+            item["batch_ranges"] = "、".join(detail.get("batch_ranges", []))
+            item["assigned_segments"] = "、".join(detail.get("assigned_segments", []))
+            item["task_statuses"] = "、".join(detail.get("task_statuses", []))
+            item["completed_segments"] = "、".join(detail.get("completed_segments", []))
+            item["workflow_names"] = "、".join(detail.get("workflow_names", []))
+            item["volume_count"] = detail.get("volume_count", 0)
+
+        return result
 
     def get_completed_statistics_count(
             self,
@@ -228,6 +347,14 @@ class TaskService:
             "batch_count": row.batch_count or 0,
             "task_count": row.task_count or 0,
             "workflow_count": row.workflow_count or 0,
+            "volume_count": sum(
+                self.get_completed_volume_count(task.complete_number)
+                for task in self._completed_task_query(
+                    operator=operator,
+                    start_date=start_date,
+                    end_date=end_date,
+                ).all()
+            ),
         }
 
     def get_completed_detail_list(

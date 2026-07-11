@@ -295,7 +295,10 @@ class StatisticsTableWindow(FramelessWindow):
     def create_table(self, parent_layout):
         self.table_widget = TableWidget()
 
-        headers = ["ID",  "用户名", "完成批次", "完成任务段", "涉及流程", "最后完成时间", "操作"]
+        headers = [
+            "ID", "用户名", "批次号", "批次起止卷/件号", "本人分配卷/件号",
+            "任务状态", "已完成任务段", "涉及流程", "卷/件数", "最后完成时间"
+        ]
         self.table_widget.setColumnCount(len(headers))
         self.table_widget.setHorizontalHeaderLabels(headers)
         header_font = QFont()
@@ -321,11 +324,14 @@ class StatisticsTableWindow(FramelessWindow):
         # 设置列宽
         self.table_widget.setColumnWidth(0, 60)  # ID
         self.table_widget.setColumnWidth(1, 130)  # 用户名
-        self.table_widget.setColumnWidth(2, 120)  # 完成批次
-        self.table_widget.setColumnWidth(3, 120)  # 完成任务段
-        self.table_widget.setColumnWidth(4, 120)  # 涉及流程
-        self.table_widget.setColumnWidth(5, 180)  # 最后完成时间
-        self.table_widget.setColumnWidth(6, 140)  # 操作
+        self.table_widget.setColumnWidth(2, 160)  # 批次号
+        self.table_widget.setColumnWidth(3, 180)  # 批次起止卷/件号
+        self.table_widget.setColumnWidth(4, 180)  # 本人分配卷/件号
+        self.table_widget.setColumnWidth(5, 110)  # 任务状态
+        self.table_widget.setColumnWidth(6, 180)  # 已完成任务段
+        self.table_widget.setColumnWidth(7, 180)  # 涉及流程
+        self.table_widget.setColumnWidth(8, 90)  # 卷/件数
+        self.table_widget.setColumnWidth(9, 180)  # 最后完成时间
 
         # 设置行高
         self.table_widget.verticalHeader().setDefaultSectionSize(45)
@@ -425,6 +431,13 @@ class StatisticsTableWindow(FramelessWindow):
                 "batch_count": item.get("batch_count") or 0,
                 "task_count": item.get("task_count") or 0,
                 "workflow_count": item.get("workflow_count") or 0,
+                "batch_numbers": item.get("batch_numbers") or "",
+                "batch_ranges": item.get("batch_ranges") or "",
+                "assigned_segments": item.get("assigned_segments") or "",
+                "task_statuses": item.get("task_statuses") or "",
+                "completed_segments": item.get("completed_segments") or "",
+                "workflow_names": item.get("workflow_names") or "",
+                "volume_count": item.get("volume_count") or 0,
                 "first_done_at": item.get("first_done_at"),
                 "last_done_at": item.get("last_done_at"),
             })
@@ -435,7 +448,8 @@ class StatisticsTableWindow(FramelessWindow):
             f"用户数：{summary['operator_count']}  "
             f"完成批次：{summary['batch_count']}  "
             f"完成任务段：{summary['task_count']}  "
-            f"涉及流程：{summary['workflow_count']}"
+            f"涉及流程：{summary['workflow_count']}  "
+            f"卷/件数：{summary['volume_count']}"
         )
 
     def calculate_total_pages(self):
@@ -465,32 +479,19 @@ class StatisticsTableWindow(FramelessWindow):
             row_values = [
                 str(data["index"]),
                 data["operator"],
-                str(data["batch_count"]),
-                str(data["task_count"]),
-                str(data["workflow_count"]),
+                data["batch_numbers"],
+                data["batch_ranges"],
+                data["assigned_segments"],
+                data["task_statuses"],
+                data["completed_segments"],
+                data["workflow_names"],
+                str(data["volume_count"]),
                 data["last_done_at"].strftime("%Y-%m-%d %H:%M:%S") if data["last_done_at"] else "",
-                "",
             ]
             for col, value in enumerate(row_values):
-                if col == len(row_values) - 1:  # 操作列
-                    button_widget = QWidget()
-                    button_layout = QHBoxLayout(button_widget)
-                    button_layout.setContentsMargins(5, 2, 5, 2)
-                    button_layout.setSpacing(5)
-                    details_button = PrimaryPushButton("查看详情")
-                    details_button.setFixedSize(100, 32)
-                    details_button.setCursor(Qt.PointingHandCursor)
-                    original_row = row
-                    details_button.clicked.connect(lambda checked, r=original_row: self.on_details_clicked(r))
-                    button_layout.addWidget(details_button)
-
-                    button_layout.addStretch()
-
-                    self.table_widget.setCellWidget(row, col, button_widget)
-                else:
-                    item = QTableWidgetItem(value)
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    self.table_widget.setItem(row, col, item)
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table_widget.setItem(row, col, item)
 
     def on_page_size_changed(self, text):
         try:
@@ -514,22 +515,6 @@ class StatisticsTableWindow(FramelessWindow):
             self.current_page += 1
             self.calculate_total_pages()
             self.update_table_display()
-
-    def on_details_clicked(self, row):
-        global_cache.set("current_data", {
-            "operator": self.all_data[row]["operator"],
-            "period": self.period_combo.currentText(),
-            "range_label": self.current_range_label,
-            "start_date": self.current_start_date,
-            "end_date": self.current_end_date,
-        })
-
-        self._is_navigation = True
-
-        from src.view.statistics.details_table import DetailsTableWindow
-        details_window = DetailsTableWindow()
-        details_window.showFullScreen()
-        QTimer.singleShot(100, self.close)
 
     def update_user_label(self):
         user_info = global_cache.get("current_user")

@@ -233,8 +233,8 @@ class PretreatmentAddWindow(FramelessWindow):
         button_layout.addWidget(self.submit_btn)
         main_layout.addLayout(button_layout)
         self.setLayout(main_layout)
-        self.update_table_display()
         self.update_page_data()
+        self.update_table_display()
 
 
     def create_navigation_breadcrumb(self, parent_layout):
@@ -396,8 +396,26 @@ class PretreatmentAddWindow(FramelessWindow):
             return
         self.table_widget.setRowCount(0)
         self.all_dat = []
+        number_start = self.start_number_edit.text().strip()
+        number_end = self.end_number_edit.text().strip()
+        try:
+            range_start = int(number_start)
+            range_end = int(number_end)
+        except ValueError:
+            logger.warning(f"起止卷/件号格式错误，无法加载问题记录: {number_start} - {number_end}")
+            return
+
         questions_list = register_question_service.get_list(register_id=self.task_info.register_id)
         for item in questions_list:
+            try:
+                volume_number = int(item.volume_number)
+            except (TypeError, ValueError):
+                logger.warning(f"问题记录卷/件号格式错误，已跳过: id={item.id}, volume_number={item.volume_number}")
+                continue
+
+            if not range_start <= volume_number <= range_end:
+                continue
+
             row_data = [
                 str(item.id),
                 item.volume_number,
@@ -531,7 +549,6 @@ class PretreatmentAddWindow(FramelessWindow):
 
         number_start = self.start_number_edit.text().strip()
         number_end = self.end_number_edit.text().strip()
-
 
 
         if len(number_start) != 4 or len(number_end) != 4:
