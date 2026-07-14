@@ -13,6 +13,7 @@ from sqlalchemy import asc, desc, func
 from src.core.db import SessionLocal, fetch_page
 from src.core.settings import settings
 from src.models.task import Task
+from src.models.task_progress import TaskProgress
 from src.services.workflow_service import workflow_service
 
 
@@ -237,6 +238,118 @@ class TaskService:
             return "完成"
         return "进行中"
 
+    @classmethod
+    def _progress_status_text(cls, task: Task, sub_end: Optional[str]) -> str:
+        completed_end = cls._range_end_value(sub_end)
+        assigned_end = cls._range_end_value(cls._range_text(task.task_number_start, task.task_number_end))
+        if completed_end is not None and assigned_end is not None and completed_end >= assigned_end:
+            return "完成"
+        return "进行中"
+
+    def _completed_progress_query(
+            self,
+            operator: Optional[str] = None,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
+    ):
+        query = (
+            self.db.query(TaskProgress, Task)
+            .join(Task, TaskProgress.task_id == Task.id)
+            .filter(
+                Task.status == 1,
+                TaskProgress.status == 1,
+                TaskProgress.operator.isnot(None),
+                TaskProgress.operate_date.isnot(None),
+            )
+        )
+        if operator:
+            query = query.filter(TaskProgress.operator == operator)
+        if start_date:
+            query = query.filter(TaskProgress.operate_date >= start_date)
+        if end_date:
+            query = query.filter(TaskProgress.operate_date < end_date)
+        return query
+
+    def _completed_fallback_task_query(
+            self,
+            operator: Optional[str] = None,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
+    ):
+        progress_task_ids = self.db.query(TaskProgress.task_id).filter(TaskProgress.status == 1)
+        return self._completed_task_query(
+            operator=operator,
+            start_date=start_date,
+            end_date=end_date,
+        ).filter(~Task.id.in_(progress_task_ids))
+
+    def _build_statistics_record(
+            self,
+            task: Task,
+            operator: Optional[str],
+            completed_segment: Optional[str],
+            completed_at: Optional[datetime],
+            status_text: str,
+    ) -> Dict[str, Any]:
+        completed_segment = (completed_segment or "").strip()
+        return {
+            "operator": operator or task.operator or "未知用户",
+            "batch_count": 1,
+            "task_count": 1,
+            "workflow_count": 1,
+            "first_done_at": completed_at,
+            "last_done_at": completed_at,
+            "batch_numbers": task.batch_number or "",
+            "batch_ranges": self._range_text(task.number_start, task.number_end),
+            "assigned_segments": self._range_text(task.task_number_start, task.task_number_end),
+            "task_statuses": status_text,
+            "completed_segments": completed_segment,
+            "workflow_names": task.task_name or "",
+            "volume_count": self.get_completed_volume_count(completed_segment),
+        }
+
+    def _completed_statistics_records(
+            self,
+            operator: Optional[str] = None,
+            start_date: Optional[datetime] = None,
+            end_date: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        records = []
+        progress_rows = (
+            self._completed_progress_query(operator=operator, start_date=start_date, end_date=end_date)
+            .order_by(TaskProgress.operate_date.desc(), TaskProgress.id.desc())
+            .all()
+        )
+        for progress, task in progress_rows:
+            completed_segment = self._range_text(progress.sub_start, progress.sub_end)
+            records.append(self._build_statistics_record(
+                task=task,
+                operator=progress.operator,
+                completed_segment=completed_segment,
+                completed_at=progress.operate_date,
+                status_text=self._progress_status_text(task, progress.sub_end),
+            ))
+
+        fallback_tasks = (
+            self._completed_fallback_task_query(operator=operator, start_date=start_date, end_date=end_date)
+            .order_by(Task.operator_date.desc(), Task.id.desc())
+            .all()
+        )
+        for task in fallback_tasks:
+            records.append(self._build_statistics_record(
+                task=task,
+                operator=task.operator,
+                completed_segment=task.complete_number,
+                completed_at=task.operator_date,
+                status_text=self._task_status_text(task),
+            ))
+
+        return sorted(
+            records,
+            key=lambda item: item["last_done_at"] or datetime.min,
+            reverse=True,
+        )
+
     def get_completed_statistics(
             self,
             skip: int = 0,
@@ -245,72 +358,12 @@ class TaskService:
             start_date: Optional[datetime] = None,
             end_date: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        query = (
-            self._completed_task_query(operator=operator, start_date=start_date, end_date=end_date)
-            .with_entities(
-                Task.operator.label("operator"),
-                func.count(func.distinct(Task.batch_number)).label("batch_count"),
-                func.count(Task.id).label("task_count"),
-                func.count(func.distinct(Task.task_name)).label("workflow_count"),
-                func.min(Task.operator_date).label("first_done_at"),
-                func.max(Task.operator_date).label("last_done_at"),
-            )
-            .group_by(Task.operator)
-            .order_by(Task.operator.asc())
+        records = self._completed_statistics_records(
+            operator=operator,
+            start_date=start_date,
+            end_date=end_date,
         )
-        rows = query.offset(skip).limit(limit).all()
-        result = [row._asdict() for row in rows]
-        operators = [item["operator"] for item in result if item.get("operator")]
-        if not operators:
-            return result
-
-        detail_rows = (
-            self._completed_task_query(operator=operator, start_date=start_date, end_date=end_date)
-            .filter(Task.operator.in_(operators))
-            .order_by(Task.operator.asc(), Task.operator_date.asc(), Task.id.asc())
-            .all()
-        )
-        detail_map = {
-            operator_name: {
-                "batch_numbers": [],
-                "batch_ranges": [],
-                "assigned_segments": [],
-                "task_statuses": [],
-                "completed_segments": [],
-                "workflow_names": [],
-                "volume_count": 0,
-            }
-            for operator_name in operators
-        }
-        for task in detail_rows:
-            detail = detail_map.setdefault(task.operator, {
-                "batch_numbers": [],
-                "batch_ranges": [],
-                "assigned_segments": [],
-                "task_statuses": [],
-                "completed_segments": [],
-                "workflow_names": [],
-                "volume_count": 0,
-            })
-            self._append_unique(detail["batch_numbers"], task.batch_number)
-            self._append_unique(detail["batch_ranges"], self._range_text(task.number_start, task.number_end))
-            self._append_unique(detail["assigned_segments"], self._range_text(task.task_number_start, task.task_number_end))
-            self._append_unique(detail["task_statuses"], self._task_status_text(task))
-            self._append_unique(detail["completed_segments"], task.complete_number)
-            self._append_unique(detail["workflow_names"], task.task_name)
-            detail["volume_count"] += self.get_completed_volume_count(task.complete_number)
-
-        for item in result:
-            detail = detail_map.get(item["operator"], {})
-            item["batch_numbers"] = "、".join(detail.get("batch_numbers", []))
-            item["batch_ranges"] = "、".join(detail.get("batch_ranges", []))
-            item["assigned_segments"] = "、".join(detail.get("assigned_segments", []))
-            item["task_statuses"] = "、".join(detail.get("task_statuses", []))
-            item["completed_segments"] = "、".join(detail.get("completed_segments", []))
-            item["workflow_names"] = "、".join(detail.get("workflow_names", []))
-            item["volume_count"] = detail.get("volume_count", 0)
-
-        return result
+        return records[skip: skip + limit]
 
     def get_completed_statistics_count(
             self,
@@ -318,13 +371,11 @@ class TaskService:
             start_date: Optional[datetime] = None,
             end_date: Optional[datetime] = None,
     ) -> int:
-        grouped_query = (
-            self._completed_task_query(operator=operator, start_date=start_date, end_date=end_date)
-            .with_entities(Task.operator)
-            .group_by(Task.operator)
-            .subquery()
-        )
-        return self.db.query(func.count()).select_from(grouped_query).scalar() or 0
+        return len(self._completed_statistics_records(
+            operator=operator,
+            start_date=start_date,
+            end_date=end_date,
+        ))
 
     def get_completed_statistics_summary(
             self,
@@ -332,29 +383,17 @@ class TaskService:
             start_date: Optional[datetime] = None,
             end_date: Optional[datetime] = None,
     ) -> Dict[str, int]:
-        row = (
-            self._completed_task_query(operator=operator, start_date=start_date, end_date=end_date)
-            .with_entities(
-                func.count(func.distinct(Task.operator)).label("operator_count"),
-                func.count(func.distinct(Task.batch_number)).label("batch_count"),
-                func.count(Task.id).label("task_count"),
-                func.count(func.distinct(Task.task_name)).label("workflow_count"),
-            )
-            .one()
+        records = self._completed_statistics_records(
+            operator=operator,
+            start_date=start_date,
+            end_date=end_date,
         )
         return {
-            "operator_count": row.operator_count or 0,
-            "batch_count": row.batch_count or 0,
-            "task_count": row.task_count or 0,
-            "workflow_count": row.workflow_count or 0,
-            "volume_count": sum(
-                self.get_completed_volume_count(task.complete_number)
-                for task in self._completed_task_query(
-                    operator=operator,
-                    start_date=start_date,
-                    end_date=end_date,
-                ).all()
-            ),
+            "operator_count": len({record["operator"] for record in records if record["operator"]}),
+            "batch_count": len({record["batch_numbers"] for record in records if record["batch_numbers"]}),
+            "task_count": len(records),
+            "workflow_count": len({record["workflow_names"] for record in records if record["workflow_names"]}),
+            "volume_count": sum(record["volume_count"] for record in records),
         }
 
     def get_completed_detail_list(
