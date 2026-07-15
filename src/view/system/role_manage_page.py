@@ -708,8 +708,8 @@ class RoleManagePage(QWidget):
                 role.name,
                 ", ".join([work.work_name for work in role.workflows] if role.workflows else ""),
                 role.desc,
-                role.create_time.strftime("%Y-%m-%d %H:%M:%S"),
-                role.update_time.strftime("%Y-%m-%d %H:%M:%S") if role.update_time else "",
+                role.create_time.strftime("%Y-%m-%d %H:%M:%S") if role.create_time else None,
+                role.update_time.strftime("%Y-%m-%d %H:%M:%S") if role.update_time else None,
                 ""
             ]
             self.all_data.append(role_data)

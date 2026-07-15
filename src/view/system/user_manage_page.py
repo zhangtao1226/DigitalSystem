@@ -443,49 +443,16 @@ class UserManagePage(QWidget):
                     edit_button = PrimaryPushButton("修改")
                     edit_button.setFixedSize(80, 32)
                     edit_button.setCursor(Qt.PointingHandCursor)
-                    # edit_button.setStyleSheet(
-                    #     """
-                    #     QPushButton {
-                    #         background-color: #1890ff;
-                    #         color: white;
-                    #         border-radius: 6px;
-                    #         padding: 8px 16px;
-                    #         font-weight: 500;
-                    #     }
-                    #     QPushButton:hover {
-                    #         background-color: #40a9ff;
-                    #     }
-                    #     QPushButton:pressed {
-                    #         background-color: #096dd9;
-                    #     }
-                    #     """
-                    # )
 
                     # 删除按钮
                     delete_button = PrimaryPushButton("删除")
                     delete_button.setFixedSize(80, 32)
                     delete_button.setCursor(Qt.PointingHandCursor)
-                    # delete_button.setStyleSheet(
-                    #     """
-                    #     QPushButton {
-                    #         background-color: #ef5b5b;
-                    #         color: white;
-                    #         border-radius: 6px;
-                    #         padding: 8px 16px;
-                    #         font-weight: 500;
-                    #     }
-                    #     QPushButton:hover {
-                    #         background-color: #ed2c2c;
-                    #     }
-                    #     QPushButton:pressed {
-                    #         background-color: #d32f2f;
-                    #     }
-                    #     """
-                    # )
 
-                    # if data[2] == "管理员" or data[2] == "质检员":
-                    #     edit_button.setEnabled(False)
-                    #     delete_button.setEnabled(False)
+
+                    if data[2] == "管理员" or data[2] == "质检员":
+                        edit_button.setEnabled(False)
+                        delete_button.setEnabled(False)
 
                     # 连接信号
                     original_row = start_index + row
