@@ -17,6 +17,7 @@ from qfluentwidgets import (
 from qframelesswindow import FramelessWindow, StandardTitleBar
 
 from src.core.cache_manager import global_cache
+from src.utils.LoggerDetector import logger
 # 主窗口
 class SystemMainWindow(FramelessWindow):
     PAGE_SPECS = {
@@ -373,6 +374,7 @@ class SystemMainWindow(FramelessWindow):
             page_class = getattr(module, class_name)
             page = page_class()
         except Exception as exc:
+            logger.exception(f"{title}加载失败")
             self.loading_label.setText(f"{title}加载失败：{exc}")
             return
 

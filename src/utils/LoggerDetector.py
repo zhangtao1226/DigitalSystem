@@ -10,11 +10,27 @@ import re
 import glob
 import time
 import logging
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 
 from src.core.settings import settings
+
+
+def _resolve_log_dir(log_dir: str) -> Path:
+    log_path = Path(log_dir or "logs")
+    if log_path.is_absolute():
+        return log_path
+    return Path.cwd() / log_path
+
+
+def _to_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 
 class SizeAndTimeRotatingHandler(TimedRotatingFileHandler):
     def __init__(self, filename, when='M', interval=1, backupCount=7, maxBytes=10 * 1024 * 1024,
@@ -68,12 +84,12 @@ class SizeAndTimeRotatingHandler(TimedRotatingFileHandler):
         except Exception as e:
             print(f"日志文件重命名失败: {e}")
 
-        self._cleanup_odl_logs()
+        self._cleanup_old_logs()
 
         if not self.delay:
             self.stream = self._open()
 
-    def _cleanup_odl_logs(self):
+    def _cleanup_old_logs(self):
         if self.backupCount <= 0:
             return
 
@@ -88,41 +104,52 @@ class SizeAndTimeRotatingHandler(TimedRotatingFileHandler):
                 file_mtime = os.path.getmtime(file_path)
                 if file_mtime < expire_timestamp:
                     os.remove(file_path)
-                    log_files.remove(file_path)
-                    continue
             except Exception as e:
                 print(f"清理日志文件失败; {file_path}: {e}")
 
-        retain_files = log_files[-self.backupCount:]
-        for file_path in log_files:
-            if file_path not in retain_files:
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    print(f"清理日志文件失败; {file_path}:{e}")
-
-def setup_logger(log_dir="logs", log_name="app", max_log_size=10, retention_days=7):
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
-    log_file_path = os.path.join(log_dir, f"{log_name}.log")
+def setup_logger(log_dir="logs", log_name="app", max_log_size=10, retention_days=7, log_level="INFO"):
+    log_dir_path = _resolve_log_dir(log_dir)
+    try:
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        log_dir_path = Path(tempfile.gettempdir()) / "DigitalSystem" / "logs"
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+    log_file_path = log_dir_path / f"{log_name}.log"
 
     logger = logging.getLogger(log_name)
     if logger.handlers:
         logger.handlers.clear()
 
-    logger.setLevel(logging.INFO)
+    logger.setLevel(getattr(logging, str(log_level).upper(), logging.INFO))
+    logger.propagate = False
 
     log_formatter = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(filename)s:%(lineno)d | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    file_handler = SizeAndTimeRotatingHandler(
-        filename=log_file_path,
-        when="midnight",
-        backupCount=retention_days,
-        maxBytes=max_log_size * 1024 * 1024,
-        encoding="utf-8"
-    )
+    backup_count = _to_int(retention_days, 7)
+    max_bytes = _to_int(max_log_size, 10) * 1024 * 1024
+
+    try:
+        file_handler = SizeAndTimeRotatingHandler(
+            filename=str(log_file_path),
+            when="midnight",
+            backupCount=backup_count,
+            maxBytes=max_bytes,
+            encoding="utf-8"
+        )
+    except OSError:
+        log_dir_path = Path(tempfile.gettempdir()) / "DigitalSystem" / "logs"
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+        log_file_path = log_dir_path / f"{log_name}.log"
+        file_handler = SizeAndTimeRotatingHandler(
+            filename=str(log_file_path),
+            when="midnight",
+            backupCount=backup_count,
+            maxBytes=max_bytes,
+            encoding="utf-8"
+        )
 
     file_handler.setFormatter(log_formatter)
 
@@ -139,8 +166,9 @@ if settings and hasattr(settings, 'log_info'):
     logger = setup_logger(
         log_dir=log_config.get("log_dir", "logs"),
         log_name=log_config.get("log_name", "app"),
-        retention_days=log_config.get("retention_days", 7),
-        max_log_size=log_config.get("max_log_size", 10),
+        retention_days=log_config.get("log_retention", log_config.get("retention_days", 7)),
+        max_log_size=log_config.get("log_size", log_config.get("max_log_size", 10)),
+        log_level=log_config.get("log_level", "INFO"),
     )
 else:
     logger = setup_logger(log_dir='logs', log_name='app', retention_days=7, max_log_size=10)

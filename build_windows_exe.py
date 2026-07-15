@@ -25,8 +25,15 @@ DATA_FILES = [
 RUNTIME_DIRS = [
     "database",
     "download_images",
+    "logs",
     "scan_file_back",
     "upload_images",
+]
+
+HIDDEN_IMPORT_PACKAGES = [
+    # 系统管理页面在 system_main.py 中通过 importlib.import_module() 懒加载。
+    # Nuitka 无法稳定追踪字符串动态导入，必须显式包含这个包。
+    "src.view.system",
 ]
 
 
@@ -40,6 +47,11 @@ def add_data_arguments(command: List[str], project_root: Path) -> None:
         source_path = project_root / source
         if source_path.exists():
             command.append(f"--include-data-file={source_path}={target}")
+
+
+def add_hidden_import_arguments(command: List[str]) -> None:
+    for package_name in HIDDEN_IMPORT_PACKAGES:
+        command.append(f"--include-package={package_name}")
 
 
 def find_dist_dir(output_root: Path) -> Optional[Path]:
@@ -124,6 +136,7 @@ def main() -> int:
         f"--output-dir={output_root}",
     ]
     add_data_arguments(command, project_root)
+    add_hidden_import_arguments(command)
     main_file = project_root / "main.py"
     command.append(str(main_file))
 

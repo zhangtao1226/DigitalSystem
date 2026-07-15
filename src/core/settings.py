@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     log_info: dict = {
         "log_name": "app",
         "log_level": "INFO",
-        "log_dir": f"{root_path}/logs",
+        "log_dir": f"{root_image_path}/logs",
         "log_size": 50,
         "log_retention": 7,
     }
