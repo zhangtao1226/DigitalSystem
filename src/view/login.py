@@ -423,7 +423,25 @@ class LoginWindow(FramelessWindow):
     def _on_database_username_options_loaded(self, status: str, result):
         self._database_available = status == "success"
         if status == "success":
-            self._set_username_options(self._stored_username_history() + list(result))
+            database_usernames = list(result)
+            valid_usernames = set(database_usernames)
+            valid_usernames.add("admin")
+
+            stored_usernames = self._stored_username_history()
+            filtered_history = [
+                username for username in stored_usernames
+                if username in valid_usernames
+            ]
+            if filtered_history != stored_usernames:
+                self._set_stored_username_history(filtered_history)
+
+            # 启动时输入框会暂时显示历史记录的第一项；如果该用户已被删除，
+            # 数据库加载完成后应同时清空输入框，避免 _set_username_options 再次加入。
+            current_username = self._username_line().text().strip()
+            if current_username in stored_usernames and current_username not in valid_usernames:
+                self._username_line().clear()
+
+            self._set_username_options(filtered_history + database_usernames)
         elif status == "init_error":
             logger.warning(f"加载用户名下拉列表失败: 数据库初始化失败; {result}")
             show_error(self, "提示", f"数据库初始化失败: {result}", duration=8000)
@@ -457,7 +475,24 @@ class LoginWindow(FramelessWindow):
         stored_usernames = self._stored_username_history()
         usernames = [username] + [name for name in stored_usernames if name != username]
         usernames = usernames[:self.USERNAME_HISTORY_LIMIT]
-        QSettings("ERREN", "DigitalSystem").setValue(self.USERNAME_HISTORY_KEY, usernames)
+        self._set_stored_username_history(usernames)
+
+    def _remove_username_history(self, username: str):
+        usernames = [
+            name for name in self._stored_username_history()
+            if name != username
+        ]
+        self._set_stored_username_history(usernames)
+
+        combo = self._username_combo()
+        index = combo.findText(username)
+        if index >= 0:
+            combo.removeItem(index)
+
+    def _set_stored_username_history(self, usernames):
+        QSettings("ERREN", "DigitalSystem").setValue(
+            self.USERNAME_HISTORY_KEY, list(usernames)
+        )
 
     def _stored_username_history(self):
         value = QSettings("ERREN", "DigitalSystem").value(self.USERNAME_HISTORY_KEY, [])
@@ -520,6 +555,7 @@ class LoginWindow(FramelessWindow):
 
         if status == "user_not_found":
             self._database_available = True
+            self._remove_username_history(self._username_line().text().strip())
             show_error(self, "登录错误", "用户不存在！")
             return
 
