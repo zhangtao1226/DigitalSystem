@@ -11,6 +11,7 @@ import time
 from paddleocr import PaddleOCR
 
 from src.core.settings import settings
+from src.utils.LoggerDetector import logger
 
 class OCRDetector:
     def __init__(self) -> None:
@@ -44,21 +45,5 @@ class OCRDetector:
                     res.save_to_json(os.path.dirname(image))
                 return res['rec_texts']
         except Exception as e:
-            print(f"OCR失败; {str(e)}")
-
-if __name__ == "__main__":
-    start = int(time.time())
-
-    image_list = [
-        r"D:\ZT_Projects\scna_test\001\0008-WS-2025·Y·BGS\0008-WS-2025·Y·BGS-0001\0008-WS-2025·Y·BGS-0003.jpg",
-    ]
-    ocr = OCRDetector()
-
-    for image in image_list:
-        text = ocr.detect(image, res_save=False)
-        print(text, f"1耗时: {int(time.time()) - start}")
-    #
-    # start_2 = int(time.time())
-    # text = ocr.detect(image, res_save=False)
-    # print(text, f"2耗时: {int(time.time()) - start_2}")
-
+            logger.exception(f"OCR失败; {str(e)}")
+            return []

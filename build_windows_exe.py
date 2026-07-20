@@ -34,6 +34,21 @@ HIDDEN_IMPORT_PACKAGES = [
     # 系统管理页面在 system_main.py 中通过 importlib.import_module() 懒加载。
     # Nuitka 无法稳定追踪字符串动态导入，必须显式包含这个包。
     "src.view.system",
+    # PaddleOCR 3.x 会通过 PaddleX 动态加载 pipeline。
+    # 打包后缺少这些动态模块/配置时，会报 pipeline (OCR) does not exist。
+    "paddleocr",
+    "paddlex",
+]
+
+PACKAGE_DATA_PACKAGES = [
+    "paddleocr",
+    "paddlex",
+]
+
+DISTRIBUTION_METADATA_PACKAGES = [
+    "paddleocr",
+    "paddlex",
+    "paddlepaddle",
 ]
 
 
@@ -52,6 +67,14 @@ def add_data_arguments(command: List[str], project_root: Path) -> None:
 def add_hidden_import_arguments(command: List[str]) -> None:
     for package_name in HIDDEN_IMPORT_PACKAGES:
         command.append(f"--include-package={package_name}")
+
+
+def add_package_data_arguments(command: List[str]) -> None:
+    for package_name in PACKAGE_DATA_PACKAGES:
+        command.append(f"--include-package-data={package_name}")
+
+    for package_name in DISTRIBUTION_METADATA_PACKAGES:
+        command.append(f"--include-distribution-metadata={package_name}")
 
 
 def find_dist_dir(output_root: Path) -> Optional[Path]:
@@ -137,6 +160,7 @@ def main() -> int:
     ]
     add_data_arguments(command, project_root)
     add_hidden_import_arguments(command)
+    add_package_data_arguments(command)
     main_file = project_root / "main.py"
     command.append(str(main_file))
 

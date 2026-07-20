@@ -527,7 +527,7 @@ class DirWindow(FramelessWindow):
             logger.info("OCR模型预热完成")
         except Exception as e:
             self.ocr_detector = None
-            logger.error(f"OCR预热模型失败： {e}")
+            logger.exception(f"OCR预热模型失败： {e}")
             show_warning(self, "提示", "OCR 模型加载失败， 识别功能可能不可用")
 
     def _get_valid_image_paths(self):
@@ -1507,9 +1507,9 @@ class DirWindow(FramelessWindow):
             # self.ocr_detector = OCRDetector()
             # print(2222)
 
-        result = self.ocr_detector.detect(image_path)
+        result = self.ocr_detector.detect(image_path) or []
         print(f"result: {result}")
-        return "".join(result)
+        return "".join(str(item) for item in result)
 
     def clear_image_selection(self):
         self.image_container.clear_selection()
@@ -1526,9 +1526,11 @@ class DirWindow(FramelessWindow):
         self.selected_temp_image = None
 
         try:
+            temp_dir = settings.temp_path
+            os.makedirs(temp_dir, exist_ok=True)
             now = datetime.now()
-            for filename in os.listdir(TEMP_DIR):
-                file_path = os.path.join(TEMP_DIR, filename)
+            for filename in os.listdir(temp_dir):
+                file_path = os.path.join(temp_dir, filename)
                 if os.path.isfile(file_path):
                     file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
                     if (now - file_mtime).total_seconds() > 1800:  # 1800秒=30分钟
