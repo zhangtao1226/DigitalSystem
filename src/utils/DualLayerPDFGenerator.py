@@ -120,6 +120,13 @@ class DualLayerPDFGenerator:
             logger.error(f"rec_texts 为空")
             return lines
 
+        if not (len(texts) == len(scores) == len(polys)):
+            logger.error(
+                "[OCR] 文本、置信度与坐标数量不一致，已拒绝生成错位文本层: "
+                f"texts={len(texts)}, scores={len(scores)}, boxes={len(polys)}"
+            )
+            return lines
+
         logger.info(f"共检测到 {len(texts)} 条文本")
 
         for i, (text, score, box) in enumerate(zip(texts, scores, polys)):
@@ -173,14 +180,26 @@ class DualLayerPDFGenerator:
 
                 box_h = mu_y1 - mu_y0
                 box_w = mu_x1 - mu_x0
-                n_chars = max(len(text), 1)
-                fontsize = max(4.0, min(box_h * 0.85, box_w / n_chars * 1.5))
+
+                # 使用字体的实际 ascent/descent 让搜索高亮框纵向贴合 OCR 框。
+                unit_ascent, unit_descent = pdfmetrics.getAscentDescent(FONT_REG_NAME, 1.0)
+                metric_height = max(unit_ascent - unit_descent, 0.01)
+                fontsize = max(1.0, box_h / metric_height)
 
                 rl_x = mu_x0
-                rl_base = TARGET_PAGE_H - mu_y1
+                rl_bottom = TARGET_PAGE_H - mu_y1
+                rl_base = rl_bottom - unit_descent * fontsize
+
+                # 字体本身的字宽与图片中的字宽不同。将整行文本水平缩放到
+                # OCR 框宽度，否则 Acrobat 的搜索高亮会逐字漂移。
+                natural_width = pdfmetrics.stringWidth(text, FONT_REG_NAME, fontsize)
+                horizontal_scale = 100.0
+                if natural_width > 0:
+                    horizontal_scale = max(10.0, min(500.0, box_w / natural_width * 100.0))
 
                 t = pdf_canvas.beginText(rl_x, rl_base)
                 t.setFont(FONT_REG_NAME, fontsize)
+                t.setHorizScale(horizontal_scale)
                 t.setTextRenderMode(3)
                 t.textOut(text)
                 pdf_canvas.drawText(t)

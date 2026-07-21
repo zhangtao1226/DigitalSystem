@@ -38,7 +38,10 @@ from src.services.user_service import UserService, user_service
 from src.services.operation_service import operation_service
 from src.utils.NotificationTool import show_error, show_warning, show_success, show_info
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
 load_dotenv(ENV_PATH, verbose=True, override=True)
 

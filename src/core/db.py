@@ -8,6 +8,7 @@
 import os
 import re
 import sqlite3
+import sys
 import threading
 from datetime import date, datetime
 from pathlib import Path
@@ -21,8 +22,15 @@ from sqlalchemy.orm import Session as OrmSession, sessionmaker
 from sqlalchemy.sql.sqltypes import Boolean, DateTime
 
 
-# 加载项目根目录 .env 文件中的数据库配置
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def _get_runtime_root() -> Path:
+    """源码模式返回项目根目录，打包模式返回 EXE 所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+# 数据库、.env 与 public.sql 都是 EXE 同级的外部运行文件，不能写入 _internal。
+PROJECT_ROOT = _get_runtime_root()
 ENV_PATH = PROJECT_ROOT / ".env"
 load_dotenv(ENV_PATH, override=False)
 

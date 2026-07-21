@@ -32,8 +32,9 @@ class OCRDetector:
             # doc_unwarping_model_dir=f"{settings.ocr_path}/UVDoc_infer",
             text_detection_model_name="PP-OCRv5_mobile_det",
             text_detection_model_dir=f"{settings.ocr_path}/PP-OCRv5_mobile_det",
-            text_recognition_model_name="PP-OCRv5_mobile_rec",
-            text_recognition_model_dir=f"{settings.ocr_path}/PP-OCRv5_mobile_rec",
+            # server_rec 更适合密集印刷文档，并与随程序发布的服务端识别模型对应。
+            text_recognition_model_name="PP-OCRv5_server_rec",
+            text_recognition_model_dir=f"{settings.ocr_path}/PP-OCRv5_server_rec_infer",
             enable_mkldnn=True,
         )
 

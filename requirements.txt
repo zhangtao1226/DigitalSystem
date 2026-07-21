@@ -48,7 +48,7 @@ opt-einsum==3.3.0
 packaging==25.0
 paddleocr==3.3.2
 paddlepaddle==3.0.0
-paddlex==3.3.10
+paddlex==3.3.13
 pandas==2.3.3
 pillow
 premailer==3.10.0
@@ -63,6 +63,7 @@ pydantic==2.12.4
 pydantic-settings==2.12.0
 pydantic_core==2.41.5
 nuitka>=2.0.0
+pyinstaller>=6.14.2
 pyobjc==12.1
 pyobjc-core==12.1
 pyobjc-framework-Accessibility==12.1

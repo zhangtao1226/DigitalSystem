@@ -384,20 +384,6 @@ INSERT INTO "public"."role_permission_association" VALUES (20, 5);
 INSERT INTO "public"."role_permission_association" VALUES (20, 6);
 INSERT INTO "public"."role_permission_association" VALUES (20, 7);
 INSERT INTO "public"."role_permission_association" VALUES (20, 8);
-INSERT INTO "public"."role_permission_association" VALUES (21, 4);
-INSERT INTO "public"."role_permission_association" VALUES (21, 6);
-INSERT INTO "public"."role_permission_association" VALUES (22, 1);
-INSERT INTO "public"."role_permission_association" VALUES (22, 2);
-INSERT INTO "public"."role_permission_association" VALUES (23, 3);
-INSERT INTO "public"."role_permission_association" VALUES (23, 5);
-INSERT INTO "public"."role_permission_association" VALUES (24, 7);
-INSERT INTO "public"."role_permission_association" VALUES (22, 8);
-INSERT INTO "public"."role_permission_association" VALUES (25, 1);
-INSERT INTO "public"."role_permission_association" VALUES (25, 3);
-INSERT INTO "public"."role_permission_association" VALUES (25, 4);
-INSERT INTO "public"."role_permission_association" VALUES (25, 7);
-INSERT INTO "public"."role_permission_association" VALUES (25, 6);
-INSERT INTO "public"."role_permission_association" VALUES (25, 2);
 
 -- ----------------------------
 -- Table structure for roles
@@ -424,11 +410,6 @@ COMMENT ON COLUMN "public"."roles"."update_time" IS '更新时间';
 -- ----------------------------
 INSERT INTO "public"."roles" VALUES (1, '管理员', '系统管理员', 't', '2026-03-17 03:05:13.688019', '2026-03-17 03:05:13.688019');
 INSERT INTO "public"."roles" VALUES (20, '质检员', '加工系统全流程质检', 't', '2026-05-08 03:06:17.983684', '2026-05-08 03:07:25.465715');
-INSERT INTO "public"."roles" VALUES (21, '图像处理员', '', 't', '2026-05-08 07:35:09.893204', '2026-05-08 07:35:09.893204');
-INSERT INTO "public"."roles" VALUES (23, '扫描员', '', 't', '2026-05-08 07:36:01.477732', '2026-05-08 07:36:01.477732');
-INSERT INTO "public"."roles" VALUES (24, '目录录入员', '', 't', '2026-05-08 07:36:15.171286', '2026-05-08 07:36:15.171286');
-INSERT INTO "public"."roles" VALUES (22, '登记员', '', 't', '2026-05-08 07:35:45.908912', '2026-05-08 07:38:29.867397');
-INSERT INTO "public"."roles" VALUES (25, '合同', '', 't', '2026-07-06 17:21:34', '2026-07-06 09:23:55.779904');
 
 -- ----------------------------
 -- Table structure for scan
@@ -626,12 +607,6 @@ CREATE TABLE "public"."user_role_association" (
 -- ----------------------------
 INSERT INTO "public"."user_role_association" VALUES (1, 1);
 INSERT INTO "public"."user_role_association" VALUES (12, 20);
-INSERT INTO "public"."user_role_association" VALUES (13, 22);
-INSERT INTO "public"."user_role_association" VALUES (14, 23);
-INSERT INTO "public"."user_role_association" VALUES (15, 21);
-INSERT INTO "public"."user_role_association" VALUES (16, 24);
-INSERT INTO "public"."user_role_association" VALUES (17, 22);
-INSERT INTO "public"."user_role_association" VALUES (18, 25);
 
 -- ----------------------------
 -- Table structure for users
@@ -659,13 +634,7 @@ COMMENT ON COLUMN "public"."users"."last_login" IS '最近登录时间';
 -- Records of users
 -- ----------------------------
 INSERT INTO "public"."users" VALUES (1, 'admin', 'scrypt:32768:8:1$Hfur7uqxX5q4LR8m$36d0cf8ec89d8782700fc7c4496600702967b48ec8290609b3c5c051eb9969161c62d0278f545b10f379d1904798c7fec95a4bf6193c54ff030555528332c8d7', 't', '2026-03-17 03:06:20.500562', '2026-03-17 03:06:20.500562', '2026-07-08 10:56:20');
-INSERT INTO "public"."users" VALUES (14, '扫描', 'scrypt:32768:8:1$FjSOAMKH3RkkGF7n$7ce8daa6376414137dc0e49c54ce8918549aeeb8f3592269055c7d47b7ffb63f51f51b0d68a63802f2dfef67baa23355a6858aeb1d3e8a857c4c96818edd115f', 't', '2026-05-08 07:36:35.436755', '2026-05-08 07:36:35.436755', '2026-07-02 19:15:02');
-INSERT INTO "public"."users" VALUES (16, '目录录入', 'scrypt:32768:8:1$InoT306kIbFQilr1$71a15fc181c2bd0e28506aee06d91cc6e89f46a087812a2f93c77b7ca6b0cf1f42c9acc0d8c3dc81a826e9836ae7b11c757193e2c344ca782a4349800d6cf332', 't', '2026-05-08 07:37:04.108518', '2026-05-08 07:37:04.108518', '2026-07-02 19:27:09');
-INSERT INTO "public"."users" VALUES (13, '登记', 'scrypt:32768:8:1$6ReMhNgjwQlGIjCG$09ff7fd66f99b4a19ebcbdc3f1250e56049ab1712fe6ab7a3fab864dcc7cfaab4ae070575c960f72441db539a6ed8d4272129d2aac68eedb126891c5457ce5fd', 't', '2026-05-08 07:36:28.744634', '2026-05-08 07:36:28.744634', '2026-07-02 17:32:04');
 INSERT INTO "public"."users" VALUES (12, '质检', 'scrypt:32768:8:1$iOqfiYg1SCBtoTCr$59b7aa69a46c9dbcb00445e8e839368ab4bb6ee1e0e6ccb594bb380a6fe7d758aef117e74150a17b67d9ab2265010d4c5d3d9d86ad47c897f2e2ffd6469f6422', 't', '2026-05-08 03:22:04.151795', '2026-05-08 03:22:11.202283', '2026-05-08 03:22:11.200266');
-INSERT INTO "public"."users" VALUES (17, '登记2', 'scrypt:32768:8:1$xxVO99rhMnIHAL6D$c4494bdc82fbad4f5e16d859205e439584edaf69123d294a696056f7e82e21692b329f8317a755bdb7ffb2cabfb455790a05419a1b2aaff6f3f27ba8e5800056', 't', '2026-05-11 17:06:54', '2026-05-11 17:06:54', '2026-07-02 18:46:46');
-INSERT INTO "public"."users" VALUES (18, '合同', 'scrypt:32768:8:1$98vM7V7Ys2QP3KuN$012f9fd135508710a27cc62b44ef54c6e2921ed20c911ceb57504eafc2a523bc629e6e9d099afbffaad3fa86c041019e3f0b7211c86a76701a27432bec824446', 't', '2026-07-06 17:22:18', '2026-07-06 17:22:18', '2026-07-06 17:41:12');
-INSERT INTO "public"."users" VALUES (15, '图像处理', 'scrypt:32768:8:1$iBxvPX2Q7qMGlh9z$baad2d2c2ebcb1633c8773e1d6e9bfab93dbce2e84873cc86c7b7bae5a783d0b358a801cf520afcf3d55f9a43bed6ea3bdd2a46d0e327768ae9fd2a851c54171', 't', '2026-05-08 07:36:50.424744', '2026-05-08 07:36:50.424744', '2026-07-06 10:06:44');
 
 -- ----------------------------
 -- Table structure for workflows
@@ -745,7 +714,7 @@ SELECT setval('"public"."register_question_id_seq"', 96, true);
 -- ----------------------------
 ALTER SEQUENCE "public"."roles_id_seq"
 OWNED BY "public"."roles"."id";
-SELECT setval('"public"."roles_id_seq"', 25, true);
+SELECT setval('"public"."roles_id_seq"', 20, true);
 
 -- ----------------------------
 -- Alter sequences owned by
@@ -787,7 +756,7 @@ SELECT setval('"public"."task_progress_id_seq"', 46, true);
 -- ----------------------------
 ALTER SEQUENCE "public"."users_id_seq"
 OWNED BY "public"."users"."id";
-SELECT setval('"public"."users_id_seq"', 18, true);
+SELECT setval('"public"."users_id_seq"', 12, true);
 
 -- ----------------------------
 -- Alter sequences owned by

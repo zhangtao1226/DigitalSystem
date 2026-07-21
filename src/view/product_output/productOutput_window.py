@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QSplitter, QTextEdit, QStackedWidget, QFileDialog,
     QTreeWidget, QTreeWidgetItem, QGraphicsPolygonItem
 )
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, QRectF, QTimer, Signal, QPointF
+from PySide6.QtCore import QObject, Qt, QUrl, QRectF, QTimer, Signal, QPointF
 from qfluentwidgets import (
     setTheme, Theme, StrongBodyLabel, MessageBox, PushButton,
     PrimaryPushButton, ScrollArea, PrimaryToolButton, FluentIcon,
@@ -45,15 +45,15 @@ class ProductOcrWorker(QObject):
     finished = Signal(int, int)
     failed = Signal(str)
 
-    def __init__(self, image_paths):
+    def __init__(self, image_paths, detector=None):
         super().__init__()
         self.image_paths = image_paths
+        self.detector = detector
 
     def run(self):
         try:
             from src.utils.OCRDetector import OCRDetector
 
-            detector = None
             success_count = 0
             failed_count = 0
             total = len(self.image_paths)
@@ -63,9 +63,9 @@ class ProductOcrWorker(QObject):
                 try:
                     ocr_path = self._get_ocr_path(image_path)
                     if not ocr_path or not os.path.exists(ocr_path):
-                        if detector is None:
-                            detector = OCRDetector()
-                        detector.detect(image_path, res_save=True)
+                        if self.detector is None:
+                            self.detector = OCRDetector()
+                        self.detector.detect(image_path, res_save=True)
                     success_count += 1
                 except Exception as e:
                     failed_count += 1
@@ -88,10 +88,11 @@ class ProductDualPdfWorker(QObject):
     finished = Signal(list, int)
     failed = Signal(str)
 
-    def __init__(self, source_folders, pdf_save_path_value):
+    def __init__(self, source_folders, pdf_save_path_value, ocr_detector=None):
         super().__init__()
         self.source_folders = source_folders
         self.pdf_save_path_value = pdf_save_path_value
+        self.ocr_detector = ocr_detector
 
     def run(self):
         try:
@@ -100,7 +101,7 @@ class ProductDualPdfWorker(QObject):
 
             self.progress_changed.emit(0, 100, "正在准备OCR和PDF生成任务...")
             pdf_generator = DualLayerPDFGenerator()
-            ocr_detector = None
+            ocr_detector = self.ocr_detector
             success_paths = []
             failed_count = 0
             total_images = sum(len(self._image_files_in_folder(folder)) for folder in self.source_folders)
@@ -119,13 +120,7 @@ class ProductDualPdfWorker(QObject):
 
                 try:
                     if os.path.exists(pdf_path):
-                        success_paths.append(pdf_path)
-                        self.progress_changed.emit(
-                            100,
-                            progress_total,
-                            f"PDF已存在，跳过 {folder_index}/{len(self.source_folders)}: {folder_name}",
-                        )
-                        continue
+                        logger.info(f"PDF已存在，将使用最新 OCR 坐标重新生成: {pdf_path}")
 
                     raw_results = []
                     for image_index, image_path in enumerate(image_paths, start=1):
@@ -137,6 +132,7 @@ class ProductDualPdfWorker(QObject):
                             f"正在OCR {folder_index}/{len(self.source_folders)} - {image_index}/{len(image_paths)}: {image_name}",
                         )
                         result, ocr_detector = self._ensure_image_ocr_result(image_path, ocr_detector)
+                        self.ocr_detector = ocr_detector
                         raw_results.append(result)
                         ocr_done += 1
                         self.progress_changed.emit(
@@ -1496,9 +1492,14 @@ class ProductOutputWindow(FramelessWindow):
             with open(ocr_path, 'r', encoding='utf-8') as f:
                 content = json.load(f)
             old = content.get('rec_texts', [])
-            # if len(new_lines) != len(old):
-            #     show_warning(self, "提示", f"行数不匹配（原 {len(old)} 行，现 {len(new_lines)} 行）")
-            #     return
+            if len(new_lines) != len(old):
+                show_warning(
+                    self,
+                    "提示",
+                    f"OCR 行数不能改变（原 {len(old)} 行，现 {len(new_lines)} 行），"
+                    "否则文本会与坐标框错位。",
+                )
+                return
             content['rec_texts'] = new_lines
             with open(ocr_path, 'w', encoding='utf-8') as f:
                 json.dump(content, f, ensure_ascii=False, indent=2)
@@ -1519,10 +1520,11 @@ class ProductOutputWindow(FramelessWindow):
             len(image_paths),
         )
         self.ocr_batch_btn.setEnabled(False)
-        self._ocr_thread = QThread(self)
-        self._ocr_worker = ProductOcrWorker(image_paths)
-        self._ocr_worker.moveToThread(self._ocr_thread)
-        self._ocr_thread.started.connect(self._ocr_worker.run)
+        # PaddleOCR/Paddle Inference 的 C++ 引擎不能安全地在 QThread 中
+        # 构造、推理和析构，否则 Windows 打包版可能在识别结束后原生崩溃。
+        # 使用主线程延迟启动，并通过进度更新中的 processEvents 保持界面响应。
+        self._ocr_thread = None
+        self._ocr_worker = ProductOcrWorker(image_paths, self.ocr_detector)
         self._ocr_worker.progress_changed.connect(
             lambda current, total, message: self._update_progress(progress_dialog, current, total, message)
         )
@@ -1530,12 +1532,9 @@ class ProductOutputWindow(FramelessWindow):
             lambda success_count, failed_count: self._on_ocr_finished(progress_dialog, success_count, failed_count)
         )
         self._ocr_worker.failed.connect(lambda message: self._on_ocr_failed(progress_dialog, message))
-        self._ocr_worker.finished.connect(self._ocr_thread.quit)
-        self._ocr_worker.failed.connect(self._ocr_thread.quit)
-        self._ocr_thread.finished.connect(self._ocr_worker.deleteLater)
-        self._ocr_thread.finished.connect(self._ocr_thread.deleteLater)
-        self._ocr_thread.finished.connect(self._clear_ocr_worker_refs)
-        self._ocr_thread.start()
+        self._ocr_worker.finished.connect(lambda *_: self._clear_ocr_worker_refs())
+        self._ocr_worker.failed.connect(lambda *_: self._clear_ocr_worker_refs())
+        QTimer.singleShot(0, self._ocr_worker.run)
 
     def dual_pdf_fun(self):
         selected_path = self._selected_output_path()
@@ -1562,10 +1561,13 @@ class ProductOutputWindow(FramelessWindow):
             max(1, total_images + len(source_folders)),
         )
         self.dual_pdf_btn.setEnabled(False)
-        self._pdf_thread = QThread(self)
-        self._pdf_worker = ProductDualPdfWorker(source_folders, self.pdf_save_path_value)
-        self._pdf_worker.moveToThread(self._pdf_thread)
-        self._pdf_thread.started.connect(self._pdf_worker.run)
+        # 双层 PDF 也会执行 OCR，必须与批量 OCR 一样留在主线程。
+        self._pdf_thread = None
+        self._pdf_worker = ProductDualPdfWorker(
+            source_folders,
+            self.pdf_save_path_value,
+            self.ocr_detector,
+        )
         self._pdf_worker.progress_changed.connect(
             lambda current, total, message: self._update_progress(progress_dialog, current, total, message)
         )
@@ -1573,12 +1575,9 @@ class ProductOutputWindow(FramelessWindow):
             lambda success_paths, failed_count: self._on_dual_pdf_finished(progress_dialog, success_paths, failed_count)
         )
         self._pdf_worker.failed.connect(lambda message: self._on_dual_pdf_failed(progress_dialog, message))
-        self._pdf_worker.finished.connect(self._pdf_thread.quit)
-        self._pdf_worker.failed.connect(self._pdf_thread.quit)
-        self._pdf_thread.finished.connect(self._pdf_worker.deleteLater)
-        self._pdf_thread.finished.connect(self._pdf_thread.deleteLater)
-        self._pdf_thread.finished.connect(self._clear_pdf_worker_refs)
-        QTimer.singleShot(80, self._pdf_thread.start)
+        self._pdf_worker.finished.connect(lambda *_: self._clear_pdf_worker_refs())
+        self._pdf_worker.failed.connect(lambda *_: self._clear_pdf_worker_refs())
+        QTimer.singleShot(80, self._pdf_worker.run)
 
     def check_path_fun(self):
         if self.current_pdf_path and os.path.exists(self.current_pdf_path):
@@ -1691,6 +1690,9 @@ class ProductOutputWindow(FramelessWindow):
                 QTimer.singleShot(800, lambda: setattr(self, "_progress_dialog", None))
 
     def _on_ocr_finished(self, progress_dialog, success_count, failed_count):
+        if self._ocr_worker is not None and self._ocr_worker.detector is not None:
+            # 保持 OCR 实例存活并复用，避免任务结束时立即析构 Paddle C++ 引擎。
+            self.ocr_detector = self._ocr_worker.detector
         self._close_progress(progress_dialog, "OCR识别完成")
         self.ocr_batch_btn.setEnabled(True)
         if self.current_selected_image:
@@ -1714,6 +1716,8 @@ class ProductOutputWindow(FramelessWindow):
         self._ocr_thread = None
 
     def _on_dual_pdf_finished(self, progress_dialog, success_paths, failed_count):
+        if self._pdf_worker is not None and self._pdf_worker.ocr_detector is not None:
+            self.ocr_detector = self._pdf_worker.ocr_detector
         if progress_dialog:
             progress_dialog.set_progress(100, 100, "双层PDF生成完成")
         self._close_progress(progress_dialog, "双层PDF生成完成")

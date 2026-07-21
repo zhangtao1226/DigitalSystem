@@ -5,13 +5,20 @@
 # @Time      : 2025/11/21 14:35
 # @Software  : PyCharm
 
+import sys
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 current_file_path = Path(__file__).resolve()
-root_path = current_file_path.parent.parent
-root_image_path = current_file_path.parent.parent.parent
+if getattr(sys, "frozen", False):
+    # 可修改的模板、扫描配置、日志和图片目录必须放在 EXE 同级，
+    # 不能使用 PyInstaller 的只读 _internal 目录。
+    root_image_path = Path(sys.executable).resolve().parent
+    root_path = root_image_path / "src"
+else:
+    root_path = current_file_path.parent.parent
+    root_image_path = current_file_path.parent.parent.parent
 
 class Settings(BaseSettings):
 
