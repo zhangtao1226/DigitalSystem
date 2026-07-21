@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QApplication, QVBoxLayout, QHBoxLayout, QHeaderVi
                                QLabel, QWidget, QLineEdit, QComboBox, QTableWidgetItem, QDialog, QSizePolicy,
                                QTreeWidget, QTreeWidgetItem, QFileSystemModel, QAbstractItemView, QStyle,
                                QGraphicsRectItem, QGraphicsScene, QGraphicsView, QGraphicsPixmapItem,
-                               QSplitter, QSizePolicy, QGroupBox, QGridLayout, QProgressDialog)
+                               QSplitter, QSizePolicy, QGroupBox, QGridLayout)
 from PySide6.QtCore import Qt, QPropertyAnimation, QTimer, QPoint, QEasingCurve, QSize, QDir, QRect, QRectF, QEvent, QThread, Signal, Slot
 from qfluentwidgets import (setTheme, Theme, StrongBodyLabel, MessageBox, PushButton, PrimaryPushButton, ScrollArea,
                             LineEdit, ComboBox, FluentIcon, TableWidget, InfoBar, InfoBarPosition, ElevatedCardWidget,
@@ -31,6 +31,7 @@ from src.services.operation_service import operation_service
 from src.utils.DocumentBorderCleaner import DocumentBorderCleaner
 from src.utils.DocumentContentDeskew import DocumentContentDeskew
 from src.utils.NotificationTool import show_error, show_success, show_warning, show_info
+from src.view.common.CommonProgressBar import CommonProgressDialog
 
 load_dotenv(verbose=True)
 
@@ -998,7 +999,10 @@ class FlowImageWidget(QWidget):
 
     def reload_image(self):
         if os.path.exists(self.img_path):
-            pixmap = QPixmap(self.img_path)
+            # QPixmap 会按文件路径使用内部缓存；自动处理会原路径覆盖图片，
+            # 因此先用 QImage 重新解码，确保拿到磁盘上的最新内容。
+            image = QImage(self.img_path)
+            pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
             if not pixmap.isNull():
                 self.original_pixmap = pixmap.copy()
                 self.current_pixmap = pixmap.copy()
@@ -1373,7 +1377,9 @@ class ImagePreviewWidget(CardWidget):
             self.reset_preview()
             return
 
-        pixmap = QPixmap(img_path)
+        # 图片可能刚被原路径覆盖，绕过 QPixmap 的文件名缓存。
+        image = QImage(img_path)
+        pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
         if not pixmap.isNull():
             self.current_pixmap = pixmap
             self.set_preview_pixmap(pixmap)
@@ -2763,9 +2769,13 @@ class ImageWindow(FramelessWindow):
         if self.current_operation_image_widget:
             self.exit_operation_state_before_operation("自动处理")
 
-        self._start_auto_process(images_list, operations)
+        self._start_auto_process(
+            images_list,
+            operations,
+            single_image=self.current_image is not None,
+        )
 
-    def _start_auto_process(self, images_list: list, operations: list):
+    def _start_auto_process(self, images_list: list, operations: list, single_image: bool = False):
         if getattr(self, "_auto_process_worker", None) and self._auto_process_worker.isRunning():
             show_warning(self, "警告", "自动处理正在执行，请稍候", 2000)
             return
@@ -2773,21 +2783,26 @@ class ImageWindow(FramelessWindow):
         total = len(images_list) * len(operations)
         self._auto_process_images = images_list
         self._auto_process_operations = operations
+        self._auto_process_single_image = single_image
+        self._auto_process_preview_path = images_list[0]
         self._auto_process_refresh_folder = (
             os.path.dirname(images_list[0])
-            if self.current_image is not None
+            if single_image
             else self.directory_tree.current_selected_folder
         )
 
-        self._auto_process_progress = QProgressDialog("准备自动处理...", "取消", 0, total, self)
-        self._auto_process_progress.setWindowTitle("自动处理进度")
-        self._auto_process_progress.setWindowModality(Qt.ApplicationModal)
-        self._auto_process_progress.setCancelButton(None)
-        self._auto_process_progress.setMinimumDuration(0)
-        self._auto_process_progress.setAutoClose(False)
-        self._auto_process_progress.setAutoReset(False)
-        self._auto_process_progress.setValue(0)
+        self._auto_process_progress = CommonProgressDialog(
+            title="自动处理进度",
+            message="准备自动处理...",
+            show_cancel=False,
+            parent=self,
+        )
+        self._auto_process_progress.set_progress(0, max(1, total), "准备自动处理...")
         self._auto_process_progress.show()
+        self._auto_process_progress.raise_()
+        self._auto_process_progress.activateWindow()
+        self._auto_process_progress.repaint()
+        QApplication.processEvents()
 
         self.to_do.setEnabled(False)
         self._auto_process_worker = AutoImageProcessWorker(images_list, operations, self)
@@ -2802,16 +2817,16 @@ class ImageWindow(FramelessWindow):
         if not progress_dialog:
             return
 
-        progress_dialog.setMaximum(total)
-        progress_dialog.setLabelText(message)
-        progress_dialog.setValue(current)
+        progress_dialog.set_progress(current, max(1, total), message)
+        QApplication.processEvents()
 
     @Slot(bool, object)
     def _on_auto_process_finished(self, success: bool, errors: list):
         progress_dialog = getattr(self, "_auto_process_progress", None)
         if progress_dialog:
-            progress_dialog.close()
-            progress_dialog.deleteLater()
+            progress_dialog.finish("自动处理完成" if success else "自动处理完成，部分图片失败")
+            QTimer.singleShot(800, progress_dialog.close)
+            QTimer.singleShot(800, progress_dialog.deleteLater)
             self._auto_process_progress = None
 
         self.to_do.setEnabled(True)
@@ -2855,16 +2870,34 @@ class ImageWindow(FramelessWindow):
         self._auto_process_worker = None
         self._auto_process_images = []
         self._auto_process_operations = []
+        self._auto_process_preview_path = None
+        self._auto_process_single_image = False
 
     def _refresh_after_auto_process(self):
         refresh_folder = getattr(self, "_auto_process_refresh_folder", None)
+        preview_path = getattr(self, "_auto_process_preview_path", None)
+        single_image = getattr(self, "_auto_process_single_image", False)
         if self.directory_tree:
             self.directory_tree.refresh_tree()
             if refresh_folder:
                 self.directory_tree.current_selected_folder = refresh_folder
 
-        if refresh_folder and os.path.exists(refresh_folder):
+        if single_image and preview_path and os.path.exists(preview_path):
+            # 单图处理不清空整个画廊，直接刷新对应缩略图和预览。
+            image_widget = self._path_to_img_widget.get(preview_path)
+            if image_widget:
+                image_widget.reload_image()
+            self.on_image_selected(image_widget, preview_path)
+            self._preview_switch_timer.stop()
+            self._apply_pending_image_selection()
+        elif refresh_folder and os.path.exists(refresh_folder):
+            # 文件夹处理后重建画廊，并默认显示该文件夹第一张图片。
             self.load_images_from_folder(refresh_folder)
+            if preview_path and os.path.exists(preview_path):
+                image_widget = self._path_to_img_widget.get(preview_path)
+                self.on_image_selected(image_widget, preview_path)
+                self._preview_switch_timer.stop()
+                self._apply_pending_image_selection()
 
     def auto_content_deskew(self, images_list: list):
         if len(images_list) == 0:

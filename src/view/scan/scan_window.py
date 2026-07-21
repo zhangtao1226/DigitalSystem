@@ -74,6 +74,19 @@ from src.view.common.StampPreviewWidget import StampPreviewWidget
 load_dotenv(verbose=True)
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".pdf"}
 
+
+def scale_pixmap_to_fit(pixmap, target_size, margin=0):
+    """按宽、高限制等比例缩放，确保图片完整显示且不被裁切。"""
+    available_size = QSize(
+        max(1, target_size.width() - margin * 2),
+        max(1, target_size.height() - margin * 2),
+    )
+    return pixmap.scaled(
+        available_size,
+        Qt.KeepAspectRatio,
+        Qt.SmoothTransformation,
+    )
+
 if os.getenv("SINGLE_VERSION") == "TRUE":
     SINGLE_VERSION = True
 else:
@@ -241,7 +254,15 @@ class ImagePreviewDialog(QDialog):
             scroll_area_size = self.scroll_area.viewport().size()
             pixmap_size = self.original_pixmap.size()
             # 计算适应窗口的基准尺寸
-            fit_size = pixmap_size.scaled(scroll_area_size, Qt.KeepAspectRatio)
+            # 宽、高都作为上限，按较小缩放比例完整显示；预留少量安全边距，
+            # 避免视口边框或滚动条占位导致图片顶部/边缘被遮挡。
+            fit_size = pixmap_size.scaled(
+                QSize(
+                    max(1, scroll_area_size.width() - 8),
+                    max(1, scroll_area_size.height() - 8),
+                ),
+                Qt.KeepAspectRatio,
+            )
             if not self._zoom_initialized:
                 # 首次显示：以适应窗口为基准，zoom_factor 归 1
                 self.zoom_factor = 1.0
@@ -1040,11 +1061,8 @@ class ThumbnailLoader(QThread):
             try:
                 pixmap = QPixmap(path)
                 if not pixmap.isNull():
-                    pixmap = pixmap.scaled(
-                        self.THUMB_W,
-                        self.THUMB_H,
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation,
+                    pixmap = scale_pixmap_to_fit(
+                        pixmap, QSize(self.THUMB_W, self.THUMB_H), margin=2
                     )
                 else:
                     pixmap = None
@@ -1202,9 +1220,9 @@ class ScanWindow(FramelessWindow):
 
         self.set_btn = PrimaryPushButton("设置", self)
         self.scan_model_btn = PrimaryPushButton("扫描模式", self)
-        self.scan_start_btn = PrimaryPushButton("开始扫描", self)
-        self.scan_btn = PrimaryPushButton("持续扫描", self)
-        self.scan_stop_btn = PrimaryPushButton("停止扫描", self)
+        self.scan_start_btn = PrimaryPushButton("开始扫描/F1    ", self)
+        self.scan_btn = PrimaryPushButton("持续扫描/F2", self)
+        self.scan_stop_btn = PrimaryPushButton("停止扫描/F3", self)
 
         btn_font = QFont()
         btn_font.setPointSize(16)
@@ -1785,8 +1803,7 @@ class ScanWindow(FramelessWindow):
 
         if item_type == "folder":
             folder_name = os.path.basename(item_path)
-            is_bulk_dir_name = self.verify_dir_name(folder_name)
-            if is_bulk_dir_name:
+            if self.is_checkbox:
                 self.save_dir_name = folder_name[:-5]
                 self.serial_number = folder_name[-4:]
             else:
@@ -1804,20 +1821,12 @@ class ScanWindow(FramelessWindow):
         elif item_type == "file":
             folder_path = os.path.dirname(item_path)
             folder_name = os.path.basename(folder_path)
-            is_bulk_dir_name = self.verify_dir_name(folder_name)
-
             if self.is_checkbox:
-                if is_bulk_dir_name:
-                    self.save_dir_name = folder_name[:-5]
-                    self.serial_number = folder_name[-4:]
-                else:
-                    self.save_dir_name = folder_name
+                self.save_dir_name = folder_name[:-5]
+                self.serial_number = folder_name[-4:]
             else:
-                if is_bulk_dir_name:
-                    self.save_dir_name = folder_name[:-5]
-                else:
-                    self.save_dir_name = folder_name
-                    self.serial_number = "0001"
+                self.save_dir_name = folder_name
+                self.serial_number = "0001"
 
             if self.current_folder_path != folder_path:
                 self.current_folder_path = folder_path
@@ -2945,11 +2954,7 @@ class ScanWindow(FramelessWindow):
             pixmap = QPixmap(image_path)
             if not pixmap.isNull():
                 preview_label.setPixmap(
-                    pixmap.scaled(
-                        preview_label.size(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation,
-                    )
+                    scale_pixmap_to_fit(pixmap, preview_label.size(), margin=2)
                 )
             else:
                 self._draw_placeholder(
