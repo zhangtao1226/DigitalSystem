@@ -59,23 +59,32 @@ class ThumbnailLoader(QThread):
 
     def cancel(self):
         self._cancelled = True
+        self.requestInterruption()
+
+    def _should_stop(self):
+        return self._cancelled or self.isInterruptionRequested()
 
     def run(self):
         for idx, path in enumerate(self._paths):
-            if self._cancelled:
+            if self._should_stop():
                 break
             try:
                 image = QImage(path)
+                if self._should_stop():
+                    break
                 if not image.isNull():
                     thumb = image.scaled(
                         self._thumb_w, self._thumb_h,
                         Qt.KeepAspectRatio, Qt.SmoothTransformation
                     )
+                    if self._should_stop():
+                        break
                     self.thumbnail_ready.emit(self._start_index + idx, thumb)
                 else:
                     self.thumbnail_ready.emit(self._start_index + idx, None)
             except Exception:
-                self.thumbnail_ready.emit(self._start_index + idx, None)
+                if not self._should_stop():
+                    self.thumbnail_ready.emit(self._start_index + idx, None)
         self.finished_all.emit(len(self._paths))
 
 
@@ -2189,6 +2198,13 @@ class ImageWindow(FramelessWindow):
         self.selected_image_widget = None
         self._thumb_loader = None
         self._zoom_thumb_loader = None
+        self._retired_thumbnail_loaders = set()
+        self._gallery_generation = 0
+        self._pending_zoom_refresh = None
+        self._pending_image_selection = None
+        self._preview_switch_timer = QTimer(self)
+        self._preview_switch_timer.setSingleShot(True)
+        self._preview_switch_timer.timeout.connect(self._apply_pending_image_selection)
         self._all_image_paths = []
         self._path_to_img_widget = {}
         self._loaded_image_count = 0
@@ -3104,23 +3120,16 @@ class ImageWindow(FramelessWindow):
             show_warning(self, "警告", f"文件夹不存在: {folder_path}", 2000)
             return
 
-        # 取消并等待上一次加载完成
-        if hasattr(self, '_thumb_loader') and self._thumb_loader and self._thumb_loader.isRunning():
-            self._thumb_loader.cancel()
-            self._thumb_loader.quit()
-            if not self._thumb_loader.wait(3000):
-                logger.warning("ThumbnailLoader 未能在 3 秒内退出")
-            self._thumb_loader.deleteLater()
-            self._thumb_loader = None
-        if self._zoom_thumb_loader and self._zoom_thumb_loader.isRunning():
-            old_zoom_loader = self._zoom_thumb_loader
-            old_zoom_loader.cancel()
-            old_zoom_loader.quit()
-            if old_zoom_loader.wait(300):
-                old_zoom_loader.deleteLater()
-            else:
-                old_zoom_loader.finished.connect(old_zoom_loader.deleteLater)
-            self._zoom_thumb_loader = None
+        # 切换文件夹后，旧线程发出的信号绝不能再写入新的卡片列表。
+        self._gallery_generation += 1
+        self._pending_zoom_refresh = None
+        self._preview_switch_timer.stop()
+        self._pending_image_selection = None
+        self.selected_image_widget = None
+        self._retire_thumbnail_loader(self._thumb_loader)
+        self._retire_thumbnail_loader(self._zoom_thumb_loader)
+        self._thumb_loader = None
+        self._zoom_thumb_loader = None
 
         # 收集图片路径
         image_paths = []
@@ -3174,19 +3183,46 @@ class ImageWindow(FramelessWindow):
         self._loaded_image_count = end
         self._gallery_loading_batch = True
 
-        self._thumb_loader = ThumbnailLoader(
+        generation = self._gallery_generation
+        loader = ThumbnailLoader(
             batch_paths,
             parent=self,
             start_index=start,
             thumb_w=tw,
             thumb_h=th,
         )
-        self._thumb_loader.thumbnail_ready.connect(self.gallery_widget.apply_thumbnail)
-        self._thumb_loader.finished_all.connect(
-            lambda _, done=end, total=len(self._all_image_paths), show=show_done_message:
-                self._on_gallery_batch_loaded(done, total, show)
+        self._thumb_loader = loader
+        loader.thumbnail_ready.connect(
+            lambda index, image, current_generation=generation:
+                self._apply_thumbnail_if_current(current_generation, index, image)
         )
-        self._thumb_loader.start()
+        loader.finished_all.connect(
+            lambda _, current_loader=loader, current_generation=generation,
+                   done=end, total=len(self._all_image_paths), show=show_done_message:
+                self._on_gallery_loader_finished(
+                    current_loader, current_generation, done, total, show
+                )
+        )
+        loader.start()
+
+    def _apply_thumbnail_if_current(self, generation: int, index: int, image):
+        if generation != self._gallery_generation:
+            return
+        self.gallery_widget.apply_thumbnail(index, image)
+
+    def _on_gallery_loader_finished(
+        self,
+        loader,
+        generation: int,
+        loaded_count: int,
+        total_count: int,
+        show_done_message: bool,
+    ):
+        if loader is self._thumb_loader:
+            self._thumb_loader = None
+        if generation == self._gallery_generation:
+            self._on_gallery_batch_loaded(loaded_count, total_count, show_done_message)
+        self._dispose_finished_loader(loader)
 
     def _on_gallery_batch_loaded(self, loaded_count: int, total_count: int, show_done_message: bool = False):
         self._gallery_loading_batch = False
@@ -3204,34 +3240,78 @@ class ImageWindow(FramelessWindow):
         loaded_paths = self._all_image_paths[:self._loaded_image_count]
         if not loaded_paths:
             return
+        self._pending_zoom_refresh = (
+            thumb_w,
+            thumb_h,
+            self._gallery_generation,
+        )
         if self._zoom_thumb_loader and self._zoom_thumb_loader.isRunning():
-            old_loader = self._zoom_thumb_loader
-            old_loader.cancel()
-            old_loader.quit()
-            if old_loader.wait(300):
-                old_loader.deleteLater()
-            else:
-                old_loader.finished.connect(old_loader.deleteLater)
+            # 不并发启动多个缩放加载器；取消后由 finished 回调启动最新请求。
+            self._zoom_thumb_loader.cancel()
+            return
+        self._start_pending_zoom_loader()
 
-        self._zoom_thumb_loader = ThumbnailLoader(
+    def _start_pending_zoom_loader(self):
+        pending = self._pending_zoom_refresh
+        if pending is None:
+            return
+        thumb_w, thumb_h, generation = pending
+        self._pending_zoom_refresh = None
+        if generation != self._gallery_generation:
+            return
+        loaded_paths = self._all_image_paths[:self._loaded_image_count]
+        if not loaded_paths:
+            return
+
+        loader = ThumbnailLoader(
             loaded_paths,
             parent=self,
             start_index=0,
             thumb_w=thumb_w,
             thumb_h=thumb_h,
         )
-        self._zoom_thumb_loader.thumbnail_ready.connect(self.gallery_widget.apply_thumbnail)
-        current_loader = self._zoom_thumb_loader
-        self._zoom_thumb_loader.finished_all.connect(lambda _: self._clear_zoom_thumb_loader(current_loader))
-        self._zoom_thumb_loader.start()
+        self._zoom_thumb_loader = loader
+        loader.thumbnail_ready.connect(
+            lambda index, image, current_generation=generation:
+                self._apply_thumbnail_if_current(current_generation, index, image)
+        )
+        loader.finished_all.connect(
+            lambda _, current_loader=loader, current_generation=generation:
+                self._on_zoom_loader_finished(current_loader, current_generation)
+        )
+        loader.start()
 
-    def _clear_zoom_thumb_loader(self, loader=None):
-        if loader is None:
-            loader = self._zoom_thumb_loader
-        if loader:
-            loader.deleteLater()
+    def _on_zoom_loader_finished(self, loader, generation: int):
         if loader is self._zoom_thumb_loader:
             self._zoom_thumb_loader = None
+        self._dispose_finished_loader(loader)
+        if generation == self._gallery_generation and self._pending_zoom_refresh is not None:
+            QTimer.singleShot(0, self._start_pending_zoom_loader)
+
+    def _retire_thumbnail_loader(self, loader):
+        if loader is None:
+            return
+        loader.cancel()
+        try:
+            loader.thumbnail_ready.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        if loader.isRunning():
+            self._retired_thumbnail_loaders.add(loader)
+        self._dispose_finished_loader(loader)
+
+    def _dispose_finished_loader(self, loader):
+        if loader is None:
+            return
+        if loader.isRunning():
+            if not getattr(loader, "_dispose_when_finished", False):
+                loader._dispose_when_finished = True
+                loader.finished.connect(
+                    lambda current_loader=loader: self._dispose_finished_loader(current_loader)
+                )
+            return
+        self._retired_thumbnail_loaders.discard(loader)
+        loader.deleteLater()
 
     def _update_mark_count_badge(self):
         count = len(self._pending_mark_paths)
@@ -3247,10 +3327,22 @@ class ImageWindow(FramelessWindow):
     def on_image_selected(self, image_widget, img_path=None):
         if img_path:
             actual_img_path = img_path
-            self.current_image = img_path
         elif image_widget and hasattr(image_widget, 'img_path'):
             actual_img_path = image_widget.img_path
         else:
+            return
+        self.current_image = actual_img_path
+        self._pending_image_selection = (image_widget, actual_img_path)
+        # 合并快速连续点击，只解码并显示最后选中的完整图片。
+        self._preview_switch_timer.start(75)
+
+    def _apply_pending_image_selection(self):
+        pending = self._pending_image_selection
+        self._pending_image_selection = None
+        if pending is None:
+            return
+        image_widget, actual_img_path = pending
+        if not os.path.exists(actual_img_path):
             return
         self.end_all_states_before_switch()
         if self.selected_image_widget:
@@ -3269,6 +3361,27 @@ class ImageWindow(FramelessWindow):
         self.preview_widget.set_preview_image(actual_img_path)
         self.preview_widget.update_undo_button_state(image_widget, None)
         self.image_path_label.setText(actual_img_path)
+
+    def _shutdown_thumbnail_loaders(self) -> bool:
+        self._preview_switch_timer.stop()
+        self._pending_image_selection = None
+        loaders = {
+            loader
+            for loader in (
+                self._thumb_loader,
+                self._zoom_thumb_loader,
+                *tuple(self._retired_thumbnail_loaders),
+            )
+            if loader is not None
+        }
+        for loader in loaders:
+            loader.cancel()
+        all_stopped = True
+        for loader in loaders:
+            if loader.isRunning() and not loader.wait(5000):
+                logger.error("图片加载线程未能安全退出，已取消关闭窗口")
+                all_stopped = False
+        return all_stopped
 
     def end_all_states_before_switch(self):
         if self.current_operation_image_widget:
@@ -3307,7 +3420,10 @@ class ImageWindow(FramelessWindow):
 
     def closeEvent(self, event):
         if self._is_navigation:
-            event.accept()
+            if self._shutdown_thumbnail_loaders():
+                event.accept()
+            else:
+                event.ignore()
             return
 
         if not self._is_app_exiting:
@@ -3320,6 +3436,10 @@ class ImageWindow(FramelessWindow):
             box.cancelButton.setText('取消')
 
             if box.exec():
+                if not self._shutdown_thumbnail_loaders():
+                    event.ignore()
+                    show_warning(self, "提示", "图片仍在释放中，请稍后再关闭窗口")
+                    return
                 self._is_app_exiting = True
                 event.accept()
                 self.logout()
