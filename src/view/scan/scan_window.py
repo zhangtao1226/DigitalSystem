@@ -759,35 +759,7 @@ class SettingsDialog(QDialog):
         color_layout.addWidget(self.color_combo)
         color_layout.addStretch()
 
-        scan_widget = QWidget()
-        scan_widget.setStyleSheet("background-color: transparent;")
-        scan_layout = QHBoxLayout(scan_widget)
-        scan_layout.setSpacing(5)
-        scan_layout.setContentsMargins(0, 0, 0, 0)
-        scan_layout.setAlignment(Qt.AlignRight)
-
-        scan_label = QLabel("扫描方式:", self)
-        scan_label.setStyleSheet("""
-            QLabel {
-                font-size: 14px;
-                font-weight: bold;
-                color: #34495e;
-                min-width: 80px;
-            }
-        """)
-        self.scan_combo = ComboBox(self)
-        self.scan_combo.addItems(["单面扫描", "双面扫描"])
-        self.scan_combo.setCurrentText("单面扫描")
-        self.scan_combo.setMinimumHeight(34)
-        self.scan_combo.setMinimumWidth(150)
-        self.scan_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-
-        scan_layout.addWidget(scan_label)
-        scan_layout.addWidget(self.scan_combo)
-        scan_layout.addStretch()
-
         param_row2.addWidget(color_widget)
-        param_row2.addWidget(scan_widget)
         param_row2.addStretch()
 
         param_form_layout.addWidget(param_row1_widget)
@@ -890,16 +862,11 @@ class SettingsDialog(QDialog):
             self.main_window.image_type = self.image_type_combo.currentText()
             self.main_window.resolution_dpi = self.resolution_combo.currentText()
             self.main_window.color_value = self.color_combo.currentText()
-            self.main_window.scan_format_value = (
-                0 if self.scan_combo.currentText() == "单面扫描" else 1
-            )
-
             params_text = (
                 f"格式: {self.main_window.image_type} | "
                 f"分辨率: {self.main_window.resolution_dpi} | "
                 f"色彩：{self.main_window.color_value} | "
-                f"旋转：{self.main_window.angle_value} | "
-                f"扫描：{'单面扫描' if self.main_window.scan_format_value == 0 else '双面扫描'} "
+                f"旋转：{self.main_window.angle_value}"
             )
             self.main_window.current_params_label.setText(params_text)
             self.main_window.save_dir_path_label.setText(
@@ -1355,6 +1322,19 @@ class ScanWindow(FramelessWindow):
 
         param_button_layout.addWidget(param_title)
         param_button_layout.addWidget(self.current_params_label)
+        scan_format_label = QLabel("扫描方式:", self)
+        scan_format_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #0066cc;"
+        )
+        self.scan_format_combo = ComboBox(self)
+        self.scan_format_combo.addItems(["单面扫描", "双面扫描"])
+        self.scan_format_combo.setCurrentText("单面扫描")
+        self.scan_format_combo.setFixedSize(130, 36)
+        self.scan_format_combo.currentTextChanged.connect(
+            self.on_scan_format_changed
+        )
+        param_button_layout.addWidget(scan_format_label)
+        param_button_layout.addWidget(self.scan_format_combo)
         param_button_layout.addStretch(1)
 
         self.sign_btn = PushButton("⚑ 标记")
@@ -1989,6 +1969,10 @@ class ScanWindow(FramelessWindow):
     def show_scan_mode(self):
         dialog = ScanModeDialog(self)
         dialog.exec()
+
+    def on_scan_format_changed(self, scan_format):
+        """同步主页面扫描方式，扫描时会通过 scan_format 传给扫描仪。"""
+        self.scan_format_value = 0 if scan_format == "单面扫描" else 1
 
     def start_scan(self):
         if self.save_dir_path == "":

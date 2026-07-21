@@ -9,6 +9,7 @@ import os
 import sys
 from dotenv import load_dotenv
 from datetime import datetime
+from openpyxl import load_workbook
 
 from PySide6.QtGui import QFont, QCursor
 from PySide6.QtWidgets import (QApplication, QVBoxLayout, QHBoxLayout, QHeaderView,
@@ -66,6 +67,52 @@ class RegisterAddWindow(FramelessWindow):
         window_size.moveCenter(screen_center)
         self.move(window_size.topLeft())
 
+    @staticmethod
+    def get_archive_options_from_template():
+        """从档案模板的工作表名称中提取档案类别和卷/件类型。"""
+        archive_types = []
+        archive_unit_map = {}
+        level_to_unit = {
+            "文件级": "件",
+            "案卷级": "卷",
+            "案件级": "卷",
+        }
+
+        try:
+            workbook = load_workbook(
+                settings.archives_template_path, read_only=True, data_only=True
+            )
+            try:
+                for sheet_name in workbook.sheetnames:
+                    normalized_name = sheet_name.strip().replace("－", "-")
+                    archive_type, separator, level = normalized_name.rpartition("-")
+                    if not separator or not archive_type or level not in level_to_unit:
+                        logger.warning(f"忽略无法识别的档案模板工作表: {sheet_name}")
+                        continue
+
+                    if archive_type not in archive_types:
+                        archive_types.append(archive_type)
+                        archive_unit_map[archive_type] = set()
+
+                    archive_unit_map[archive_type].add(level_to_unit[level])
+            finally:
+                workbook.close()
+        except Exception as exc:
+            logger.error(f"读取档案模板工作表失败: {exc}")
+
+        ordered_unit_map = {
+            archive_type: [
+                unit for unit in ("件", "卷") if unit in archive_unit_map[archive_type]
+            ]
+            for archive_type in archive_types
+        }
+        return archive_types, ordered_unit_map
+
+    def update_archive_units(self, archive_type):
+        """根据当前档案类别刷新模板中实际存在的卷/件类型。"""
+        self.archive_unit_combo.clear()
+        self.archive_unit_combo.addItems(self.archive_unit_map.get(archive_type, []))
+
     def init_ui(self):
         main_layout = QVBoxLayout()
         main_layout.setSpacing(20)
@@ -110,12 +157,14 @@ class RegisterAddWindow(FramelessWindow):
         archive_type_label.setFixedWidth(120)
         archive_type_label.setFont(QFont('Microsoft YaHei', 16))
         archive_type_label.setStyleSheet("color: #555555;")
+        archive_types, self.archive_unit_map = self.get_archive_options_from_template()
         self.archive_type_combo = ComboBox()
-        self.archive_type_combo.addItems(settings.archive_type_list)
+        self.archive_type_combo.addItems(archive_types)
         self.archive_type_combo.setFixedWidth(200)
         self.archive_type_combo.setFont(QFont('Microsoft YaHei', 14))
         self.archive_unit_combo = ComboBox()
-        self.archive_unit_combo.addItems(settings.archive_unit_list)
+        self.update_archive_units(self.archive_type_combo.currentText())
+        self.archive_type_combo.currentTextChanged.connect(self.update_archive_units)
         self.archive_unit_combo.setFixedWidth(100)
         self.archive_unit_combo.setFont(QFont('Microsoft YaHei', 14))
         archive_type_layout.addWidget(archive_type_label)
