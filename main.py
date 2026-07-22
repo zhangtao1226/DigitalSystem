@@ -8,6 +8,7 @@
 import os
 import shutil
 import sys
+import multiprocessing
 import tempfile
 from pathlib import Path
 
@@ -199,4 +200,5 @@ def main():
     return exit_code
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())
