@@ -16,7 +16,18 @@ from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QImage,
+    QImageReader,
+    QKeyEvent,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -27,7 +38,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLayout,
-    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -73,6 +83,81 @@ from src.view.common.StampPreviewWidget import StampPreviewWidget
 
 load_dotenv(verbose=True)
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".pdf"}
+
+
+class FolderTreeWidget(QTreeWidget):
+    """区分目录正文点击与左侧展开/收起标志点击。"""
+
+    contentClicked = Signal(object, int)
+
+    def mousePressEvent(self, event):
+        item = self.itemAt(event.position().toPoint())
+        column = self.columnAt(int(event.position().x()))
+        clicked_content = False
+        if item is not None:
+            # visualItemRect 的左边界位于展开标志右侧；左侧区域只交给
+            # QTreeWidget 切换展开状态，不触发图片加载。
+            clicked_content = (
+                event.button() == Qt.LeftButton
+                and event.position().x() >= self.visualItemRect(item).left()
+            )
+
+        super().mousePressEvent(event)
+
+        if clicked_content:
+            self.contentClicked.emit(item, max(0, column))
+
+
+class AspectRatioImageLabel(QLabel):
+    """始终完整、居中、等比例绘制图片的预览组件。"""
+
+    def __init__(self, parent=None, safe_margin=0):
+        super().__init__(parent)
+        self._source_pixmap = QPixmap()
+        self._safe_margin = safe_margin
+        self.setAlignment(Qt.AlignCenter)
+        self.setScaledContents(False)
+
+    def setPixmap(self, pixmap):
+        self._source_pixmap = QPixmap(pixmap) if pixmap is not None else QPixmap()
+        QLabel.setPixmap(self, QPixmap())
+        QLabel.setText(self, "")
+        self.update()
+
+    def setText(self, text):
+        self._source_pixmap = QPixmap()
+        QLabel.setPixmap(self, QPixmap())
+        QLabel.setText(self, text)
+        self.update()
+
+    def clear(self):
+        self._source_pixmap = QPixmap()
+        super().clear()
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._source_pixmap.isNull():
+            return
+
+        available_rect = self.contentsRect().adjusted(
+            self._safe_margin,
+            self._safe_margin,
+            -self._safe_margin,
+            -self._safe_margin,
+        )
+        if available_rect.width() <= 0 or available_rect.height() <= 0:
+            return
+
+        scaled_size = self._source_pixmap.size().scaled(
+            available_rect.size(), Qt.KeepAspectRatio
+        )
+        target_rect = QRect(QPoint(0, 0), scaled_size)
+        target_rect.moveCenter(available_rect.center())
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(target_rect, self._source_pixmap)
 
 
 def scale_pixmap_to_fit(pixmap, target_size, margin=0):
@@ -230,7 +315,10 @@ class ImagePreviewDialog(QDialog):
 
     def load_original_image(self):
         if os.path.exists(self.image_path):
-            self.original_pixmap = QPixmap(self.image_path)
+            reader = QImageReader(self.image_path)
+            reader.setAutoTransform(True)
+            image = reader.read()
+            self.original_pixmap = QPixmap.fromImage(image)
             if self.original_pixmap.isNull():
                 self.show_error_image("图片加载失败")
             else:
@@ -928,86 +1016,8 @@ class SettingsDialog(QDialog):
         dlg.exec()
 
 
-class ScanModeDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("选择扫描模式")
-        self.setFixedSize(350, 250)
-        self.selected_mode = "单页扫描"
-        self.setStyleSheet("QDialog { background-color: #f8f9fa; }")
-        self.main_window = parent
-        self.init_ui()
-        self.load_main_window_data()
-
-    def load_main_window_data(self):
-        if self.main_window:
-            if self.main_window.scan_mode == "单页扫描":
-                self.signal_scan.setChecked(True)
-            elif self.main_window.scan_mode == "替换扫描":
-                self.replace_scan.setChecked(True)
-            elif self.main_window.scan_mode == "插入扫描":
-                self.inster_scan.setChecked(True)
-
-    def init_ui(self):
-        main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(15)
-        main_layout.setContentsMargins(30, 30, 30, 20)
-        title_label = QLabel("请选择扫描模式", self)
-        title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #0066CC;")
-        title_label.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(title_label)
-        self.signal_scan = QRadioButton("单页扫描")
-        self.replace_scan = QRadioButton("替换扫描")
-        self.inster_scan = QRadioButton("插入扫描")
-        for radio_btn in [self.signal_scan, self.replace_scan, self.inster_scan]:
-            radio_btn.setStyleSheet("QRadioButton { font-size: 16px; color: #333; }")
-        self.signal_scan.clicked.connect(self.on_mode_selected)
-        self.replace_scan.clicked.connect(self.on_mode_selected)
-        self.inster_scan.clicked.connect(self.on_mode_selected)
-        main_layout.addWidget(self.signal_scan, alignment=Qt.AlignCenter)
-        main_layout.addWidget(self.replace_scan, alignment=Qt.AlignCenter)
-        main_layout.addWidget(self.inster_scan, alignment=Qt.AlignCenter)
-        btn_layout = QHBoxLayout()
-        self.ok_btn = PrimaryPushButton("确定", self)
-        self.ok_btn.setCursor(Qt.PointingHandCursor)
-        self.cancel_btn = PushButton("取消", self)
-        self.cancel_btn.setCursor(Qt.PointingHandCursor)
-        self.ok_btn.setStyleSheet("""
-            PrimaryPushButton {
-                background-color: #27ae60; color: white;
-                border-radius: 8px; font-size: 16px; font-weight: bold; border: none;
-            }
-            PrimaryPushButton:hover { background-color: #219653; }
-        """)
-        self.cancel_btn.setStyleSheet("""
-            PushButton {
-                background-color: #e74c3c; color: white;
-                border-radius: 8px; font-size: 16px; font-weight: bold; border: none;
-            }
-            PushButton:hover { background-color: #c0392b; }
-        """)
-        self.ok_btn.setFixedSize(100, 36)
-        self.cancel_btn.setFixedSize(100, 36)
-        self.ok_btn.clicked.connect(self.accept)
-        self.cancel_btn.clicked.connect(self.reject)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.ok_btn)
-        btn_layout.addWidget(self.cancel_btn)
-        main_layout.addLayout(btn_layout)
-
-    def on_mode_selected(self):
-        radio = self.sender()
-        if radio.isChecked():
-            self.selected_mode = radio.text()
-
-    def accept(self):
-        self.parent().scan_mode = self.selected_mode
-        self.parent().current_mode_label.setText(f"当前模式: {self.selected_mode}")
-        super().accept()
-
-
 class ThumbnailLoader(QThread):
-    thumbnail_ready = Signal(int, object)
+    thumbnail_ready = Signal(str, object)
     load_finished = Signal()
 
     THUMB_W = 200
@@ -1022,20 +1032,22 @@ class ThumbnailLoader(QThread):
         self._cancelled = True
 
     def run(self):
-        for idx, path in enumerate(self._paths):
+        for path in self._paths:
             if self._cancelled:
                 break
             try:
-                pixmap = QPixmap(path)
-                if not pixmap.isNull():
-                    pixmap = scale_pixmap_to_fit(
-                        pixmap, QSize(self.THUMB_W, self.THUMB_H), margin=2
+                reader = QImageReader(path)
+                reader.setAutoTransform(True)
+                image = reader.read()
+                if not image.isNull():
+                    image = scale_pixmap_to_fit(
+                        image, QSize(self.THUMB_W, self.THUMB_H), margin=0
                     )
                 else:
-                    pixmap = None
+                    image = None
             except Exception:
-                pixmap = None
-            self.thumbnail_ready.emit(idx, pixmap)
+                image = None
+            self.thumbnail_ready.emit(path, image)
         self.load_finished.emit()
 
 
@@ -1186,8 +1198,7 @@ class ScanWindow(FramelessWindow):
         btn_layout.setSpacing(12)
 
         self.set_btn = PrimaryPushButton("设置", self)
-        self.scan_model_btn = PrimaryPushButton("扫描模式", self)
-        self.scan_start_btn = PrimaryPushButton("开始扫描/F1    ", self)
+        self.scan_start_btn = PrimaryPushButton("开始扫描/F1", self)
         self.scan_btn = PrimaryPushButton("持续扫描/F2", self)
         self.scan_stop_btn = PrimaryPushButton("停止扫描/F3", self)
 
@@ -1211,7 +1222,6 @@ class ScanWindow(FramelessWindow):
 
         for btn in [
             self.set_btn,
-            self.scan_model_btn,
             self.scan_start_btn,
             self.scan_btn,
             self.scan_stop_btn,
@@ -1222,15 +1232,26 @@ class ScanWindow(FramelessWindow):
             btn.setStyleSheet(btn_style)
 
         self.set_btn.clicked.connect(self.show_settings)
-        self.scan_model_btn.clicked.connect(self.show_scan_mode)
         self.scan_start_btn.clicked.connect(self.start_scan)
         self.scan_btn.clicked.connect(self.scan_fun)
         self.scan_stop_btn.clicked.connect(self.scan_stop_fun)
+        self.scan_start_shortcut = QShortcut(QKeySequence("F1"), self)
+        self.scan_continue_shortcut = QShortcut(QKeySequence("F2"), self)
+        self.scan_stop_shortcut = QShortcut(QKeySequence("F3"), self)
+        for shortcut in (
+            self.scan_start_shortcut,
+            self.scan_continue_shortcut,
+            self.scan_stop_shortcut,
+        ):
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.setAutoRepeat(False)
+        self.scan_start_shortcut.activated.connect(self.scan_start_btn.click)
+        self.scan_continue_shortcut.activated.connect(self.scan_btn.click)
+        self.scan_stop_shortcut.activated.connect(self.scan_stop_btn.click)
         # 初始状态：无扫描任务，停止按钮不可用
         self.scan_stop_btn.setEnabled(False)
 
         btn_layout.addWidget(self.set_btn)
-        btn_layout.addWidget(self.scan_model_btn)
         btn_layout.addWidget(self.scan_start_btn)
         btn_layout.addWidget(self.scan_btn)
         btn_layout.addWidget(self.scan_stop_btn)
@@ -1335,6 +1356,17 @@ class ScanWindow(FramelessWindow):
         )
         param_button_layout.addWidget(scan_format_label)
         param_button_layout.addWidget(self.scan_format_combo)
+        scan_mode_label = QLabel("扫描模式:", self)
+        scan_mode_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #0066cc;"
+        )
+        self.scan_mode_combo = ComboBox(self)
+        self.scan_mode_combo.addItems(["单页扫描", "替换扫描", "插入扫描"])
+        self.scan_mode_combo.setCurrentText(self.scan_mode)
+        self.scan_mode_combo.setFixedSize(130, 36)
+        self.scan_mode_combo.currentTextChanged.connect(self.on_scan_mode_changed)
+        param_button_layout.addWidget(scan_mode_label)
+        param_button_layout.addWidget(self.scan_mode_combo)
         param_button_layout.addStretch(1)
 
         self.sign_btn = PushButton("⚑ 标记")
@@ -1502,7 +1534,7 @@ class ScanWindow(FramelessWindow):
         tree_header_layout.addWidget(self.refresh_tree_btn)
         tree_layout.addLayout(tree_header_layout)
 
-        self.file_tree = QTreeWidget()
+        self.file_tree = FolderTreeWidget()
         self.file_tree.setHeaderHidden(True)
         self.file_tree.setColumnCount(1)
         self.file_tree.setIndentation(18)
@@ -1537,19 +1569,11 @@ class ScanWindow(FramelessWindow):
             QTreeWidget::branch:!has-children:!has-siblings:adjoins-item {
                 border-image: none;
             }
-            QTreeWidget::branch:has-children:!has-siblings:closed,
-            QTreeWidget::branch:closed:has-children:has-siblings {
-                image: none;
-            }
-            QTreeWidget::branch:open:has-children:!has-siblings,
-            QTreeWidget::branch:open:has-children:has-siblings {
-                image: none;
-            }
         """)
         self.file_tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self.file_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.file_tree.itemClicked.connect(self.on_tree_item_clicked)
+        self.file_tree.contentClicked.connect(self.on_tree_item_clicked)
 
         tree_layout.addWidget(self.file_tree)
         core_horizontal_splitter.addWidget(tree_container)
@@ -1739,7 +1763,8 @@ class ScanWindow(FramelessWindow):
                     self._build_tree_item_file(root_item, entry, entry_path)
                     has_any = True
 
-        self.file_tree.expandAll()
+        # 默认保持收起状态，由用户点击左侧标志按需展开目录。
+        self.file_tree.collapseAll()
 
         if has_any:
             show_success(self, "目录更新", f"已加载目录：{root_name}", 1000)
@@ -1751,6 +1776,20 @@ class ScanWindow(FramelessWindow):
             self.update_file_tree_path(self.tree_root_path)
         else:
             show_warning(self, "刷新失败", "根路径无效，请先在设置中指定保存路径")
+
+    def expand_file_tree_to_level(self, max_level=2):
+        """展开到指定目录层级，更深层目录保持收起。"""
+        root = self.file_tree.invisibleRootItem()
+
+        def _expand(parent, level):
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                data = child.data(0, Qt.UserRole) or {}
+                if data.get("type") in ("root", "folder"):
+                    child.setExpanded(level <= max_level)
+                    _expand(child, level + 1)
+
+        _expand(root, 1)
 
     def select_tree_item_by_path(self, target_path):
         root = self.file_tree.invisibleRootItem()
@@ -1907,20 +1946,18 @@ class ScanWindow(FramelessWindow):
         # ── 文件夹加载完成后，回显数据库中已有的未处理质检标记 ──
         QTimer.singleShot(600, lambda p=folder_path: self._restore_mark_states(p))
 
-    @Slot(int, object)
-    def _apply_thumbnail(self, index: int, pixmap):
-        if index >= len(self.preview_widgets):
-            return
-        widget_info = self.preview_widgets[index]
+    @Slot(str, object)
+    def _apply_thumbnail(self, image_path: str, image):
+        widget_info = self._path_to_widget.get(image_path)
         if not isinstance(widget_info, dict):
             return
         preview_label = widget_info.get("preview_label")
         if preview_label is None:
             return
-        if pixmap is not None:
-            preview_label.setPixmap(pixmap)
+        if image is not None and not image.isNull():
+            preview_label.setPixmap(QPixmap.fromImage(image))
         else:
-            img_path = widget_info.get("info", {}).get("path", "")
+            img_path = widget_info.get("info", {}).get("path", image_path)
             self._draw_placeholder(
                 preview_label, f"加载失败\n{os.path.basename(img_path)}"
             )
@@ -1958,6 +1995,7 @@ class ScanWindow(FramelessWindow):
         dialog = SettingsDialog(self)
         if dialog.exec():
             self.update_file_tree_path(self.save_dir_path)
+            self.expand_file_tree_to_level(2)
             if self.current_folder_path and os.path.exists(self.current_folder_path):
                 QTimer.singleShot(
                     100, lambda: self.select_tree_item_by_path(self.current_folder_path)
@@ -1966,13 +2004,14 @@ class ScanWindow(FramelessWindow):
                 show_info(self, "设置完成", "扫描参数已更新，请选择文件夹开始扫描")
                 return
 
-    def show_scan_mode(self):
-        dialog = ScanModeDialog(self)
-        dialog.exec()
-
     def on_scan_format_changed(self, scan_format):
         """同步主页面扫描方式，扫描时会通过 scan_format 传给扫描仪。"""
         self.scan_format_value = 0 if scan_format == "单面扫描" else 1
+
+    def on_scan_mode_changed(self, scan_mode):
+        """同步主页面扫描模式，保留原有扫描及保存逻辑。"""
+        self.scan_mode = scan_mode
+        self.current_mode_label.setText(f"当前模式: {scan_mode}")
 
     def start_scan(self):
         if self.save_dir_path == "":
@@ -2372,7 +2411,7 @@ class ScanWindow(FramelessWindow):
 
         self.clear_preview_area()
         self.load_folder_images(self.current_folder_path, force_fs=True)
-        self.refresh_file_tree()
+        self._sync_tree_folder_files(self.current_folder_path)
         self.update_scan_total()
 
         if scan_files_count == 0:
@@ -2653,7 +2692,7 @@ class ScanWindow(FramelessWindow):
         try:
             self.clear_preview_area()
             self.load_folder_images(self.current_folder_path, force_fs=True)
-            self.refresh_file_tree()
+            self._sync_tree_folder_files(self.current_folder_path)
             self.update_scan_total()
         except Exception as exc:
             logger.warning(f"停止扫描后刷新界面失败: {exc}")
@@ -2731,7 +2770,8 @@ class ScanWindow(FramelessWindow):
         # self.parts_btn.setEnabled(enabled)
         self.cancel_btn.setEnabled(enabled)
         self.set_btn.setEnabled(enabled)
-        self.scan_model_btn.setEnabled(enabled)
+        self.scan_format_combo.setEnabled(enabled)
+        self.scan_mode_combo.setEnabled(enabled)
         # 停止按钮：扫描中可用，空闲时禁用
         self.scan_stop_btn.setEnabled(not enabled)
 
@@ -2843,12 +2883,12 @@ class ScanWindow(FramelessWindow):
         img_container.setFixedSize(200, 250)
         img_container.setStyleSheet("background: transparent;")
 
-        preview_label = QLabel(img_container)
+        preview_label = AspectRatioImageLabel(img_container)
         preview_label.setFixedSize(200, 250)
         preview_label.setStyleSheet(
-            "QLabel { border-radius: 4px; background-color: #e8e8e8; }"
+            "QLabel { border: 1px solid #d9e2ec; border-radius: 6px; "
+            "background-color: #f4f6f8; color: #7f8c8d; }"
         )
-        preview_label.setAlignment(Qt.AlignCenter)
         preview_label.setText("...")  # 加载中提示
 
         mark_badge = QLabel("⚑ 已标记", img_container)
@@ -2919,12 +2959,16 @@ class ScanWindow(FramelessWindow):
         img_container.setFixedSize(200, 250)
         img_container.setStyleSheet("background: transparent;")
 
-        preview_label = QLabel(img_container)
+        preview_label = AspectRatioImageLabel(img_container)
         preview_label.setFixedSize(200, 250)
         preview_label.setStyleSheet("""
-            QLabel { border-radius: 4px; background-color: #f5f5f5; }
+            QLabel {
+                border: 1px solid #d9e2ec;
+                border-radius: 6px;
+                background-color: #f4f6f8;
+                color: #7f8c8d;
+            }
         """)
-        preview_label.setAlignment(Qt.AlignCenter)
 
         if custom_path:
             image_path = custom_path
@@ -2935,10 +2979,16 @@ class ScanWindow(FramelessWindow):
         image_exists = os.path.exists(image_path)
 
         if image_exists:
-            pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
+            reader = QImageReader(image_path)
+            reader.setAutoTransform(True)
+            image = reader.read()
+            if not image.isNull():
                 preview_label.setPixmap(
-                    scale_pixmap_to_fit(pixmap, preview_label.size(), margin=2)
+                    QPixmap.fromImage(
+                        scale_pixmap_to_fit(
+                            image, preview_label.contentsRect().size(), margin=0
+                        )
+                    )
                 )
             else:
                 self._draw_placeholder(
@@ -3076,6 +3126,106 @@ class ScanWindow(FramelessWindow):
                 _search(child)
 
         _search(root)
+
+    def _remove_tree_file_item(self, file_path: str):
+        """仅移除指定文件节点，保留目录树当前的展开和选中状态。"""
+        root = self.file_tree.invisibleRootItem()
+
+        def _remove(parent):
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                data = child.data(0, Qt.UserRole) or {}
+                if data.get("type") == "file" and data.get("path") == file_path:
+                    parent.takeChild(index)
+                    return True
+                if _remove(child):
+                    return True
+            return False
+
+        _remove(root)
+
+    def _sync_tree_folder_files(self, folder_path: str):
+        """局部同步当前文件夹的文件节点，不重建整棵目录树。"""
+        if not folder_path or not os.path.isdir(folder_path):
+            return
+
+        root = self.file_tree.invisibleRootItem()
+
+        def _find_folder(parent):
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                data = child.data(0, Qt.UserRole) or {}
+                if (
+                    data.get("type") in ("root", "folder")
+                    and data.get("path") == folder_path
+                ):
+                    return child
+                found = _find_folder(child)
+                if found is not None:
+                    return found
+            return None
+
+        folder_item = _find_folder(root)
+        if folder_item is None:
+            return
+
+        try:
+            file_paths = {
+                os.path.join(folder_path, name)
+                for name in os.listdir(folder_path)
+                if os.path.isfile(os.path.join(folder_path, name))
+                and os.path.splitext(name)[1].lower() in IMG_EXTENSIONS
+            }
+        except PermissionError:
+            return
+
+        existing_paths = set()
+        for index in range(folder_item.childCount() - 1, -1, -1):
+            child = folder_item.child(index)
+            data = child.data(0, Qt.UserRole) or {}
+            if data.get("type") != "file":
+                continue
+            child_path = data.get("path")
+            if child_path not in file_paths:
+                folder_item.takeChild(index)
+            else:
+                existing_paths.add(child_path)
+
+        for file_path in sorted(file_paths - existing_paths):
+            self._build_tree_item_file(
+                folder_item, os.path.basename(file_path), file_path
+            )
+
+    def _remove_preview_image(self, image_path: str):
+        """局部移除单张预览，避免重新创建当前目录的全部缩略图。"""
+        widget_entry = self._path_to_widget.pop(image_path, None)
+        if not widget_entry:
+            return
+
+        preview_widget = widget_entry.get("widget")
+        if preview_widget is not None:
+            for index in range(self.preview_flow_layout.count()):
+                layout_item = self.preview_flow_layout.itemAt(index)
+                if layout_item and layout_item.widget() is preview_widget:
+                    self.preview_flow_layout.takeAt(index)
+                    break
+            preview_widget.deleteLater()
+
+        if widget_entry in self.preview_widgets:
+            self.preview_widgets.remove(widget_entry)
+        if image_path in self.img_files:
+            self.img_files.remove(image_path)
+
+        self.total_scanned = len(self.preview_widgets)
+        self.total_pages = len(self.preview_widgets)
+        self.selected_preview_widget = None
+        self.selected_image_info = None
+        self.current_selected_image = None
+        self.selected_image_label.setText("选中图片: 无")
+        self.total_pages_label.setText(
+            f" 当前文件夹: {os.path.basename(self.current_folder_path)}, "
+            f"总页数: {self.total_pages}"
+        )
 
     def _restore_mark_states(self, folder_path: str):
         """
@@ -3442,16 +3592,19 @@ class ScanWindow(FramelessWindow):
                                     ),
                                 },
                             )
-                            try:
-                                os.remove(image_path)
-                                logger.info(f"标签：【{m.mark_type}】, 删除该扫描件:{m.scan_file}")
-                            except Exception as e:
-                                logger.error(f"删除失败; {m.scan_file}; 原因：{e}")
                         except Exception as e:
                             logger.error(f"更新标记状态失败 mark_id={m.id}: {e}")
 
-                    self.refresh_file_tree()
-                    self.select_tree_item_by_path(self.current_folder_path)
+                    try:
+                        os.remove(image_path)
+                        logger.info(f"删除该扫描件: {file_name}")
+                    except Exception as e:
+                        logger.error(f"删除失败; {file_name}; 原因：{e}")
+                        show_error(self, "删除失败", str(e))
+                        return
+
+                    self._remove_tree_file_item(image_path)
+                    self._remove_preview_image(image_path)
 
 
             else:
@@ -3478,10 +3631,11 @@ class ScanWindow(FramelessWindow):
                     show_warning(self, "提示", "请选中要删除的扫描件")
                     return
 
-                os.remove(f"{self.current_folder_path}/{image_name}")
+                image_path = os.path.join(self.current_folder_path, image_name)
+                os.remove(image_path)
 
-                self.refresh_file_tree()
-                self.load_folder_images(self.current_folder_path)
+                self._remove_tree_file_item(image_path)
+                self._remove_preview_image(image_path)
 
                 logger.info(
                     f"删除扫描件; 操作人: {self.current_user['username']}; "
@@ -3847,15 +4001,3 @@ class ScanWindow(FramelessWindow):
     def close_without_confirm(self):
         self._is_navigation = True
         QTimer.singleShot(100, self.close)
-
-    def keyPressEvent(self, event: QKeyEvent):
-        """全局快捷键：F1 开始扫描，F2 持续扫描"""
-        key = event.key()
-        if key == Qt.Key_F1:
-            if self.scan_start_btn.isEnabled():
-                self.start_scan()
-        elif key == Qt.Key_F2:
-            if self.scan_btn.isEnabled():
-                self.scan_fun()
-        else:
-            super().keyPressEvent(event)
