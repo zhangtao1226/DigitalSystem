@@ -1022,7 +1022,6 @@ class SettingsDialog(QDialog):
 
 class ThumbnailLoader(QThread):
     thumbnail_ready = Signal(str, object)
-    load_finished = Signal()
 
     THUMB_W = 200
     THUMB_H = 250
@@ -1042,6 +1041,14 @@ class ThumbnailLoader(QThread):
             try:
                 reader = QImageReader(path)
                 reader.setAutoTransform(True)
+                source_size = reader.size()
+                if source_size.isValid():
+                    reader.setScaledSize(
+                        source_size.scaled(
+                            QSize(self.THUMB_W, self.THUMB_H),
+                            Qt.KeepAspectRatio,
+                        )
+                    )
                 image = reader.read()
                 if not image.isNull():
                     image = scale_pixmap_to_fit(
@@ -1052,7 +1059,6 @@ class ThumbnailLoader(QThread):
             except Exception:
                 image = None
             self.thumbnail_ready.emit(path, image)
-        self.load_finished.emit()
 
 
 class ScanWindow(FramelessWindow):
@@ -1089,6 +1095,7 @@ class ScanWindow(FramelessWindow):
         self.preview_widgets = []
         self._path_to_widget: dict = {}
         self._thumb_loader: ThumbnailLoader = None
+        self._live_thumb_loaders = []
 
         self.current_folder_path = ""
         self.base_image_dir = os.path.join(os.path.expanduser("~"), "Pictures")
@@ -1958,6 +1965,53 @@ class ScanWindow(FramelessWindow):
                 preview_label, f"加载失败\n{os.path.basename(img_path)}"
             )
 
+    def _show_scanned_page_immediately(self, image_path: str):
+        """单页保存成功后立即添加卡片，再异步加载该页缩略图。"""
+        widget_info = self._path_to_widget.get(image_path)
+        if widget_info:
+            preview_label = widget_info.get("preview_label")
+            if preview_label is not None:
+                preview_label.setText("...")
+        else:
+            self._add_preview_placeholder(image_path)
+            QTimer.singleShot(
+                0, lambda path=image_path: self._ensure_preview_visible(path)
+            )
+
+        self.total_pages_label.setText(
+            f" 当前文件夹: {os.path.basename(self.current_folder_path)}, "
+            f"总页数: {self.total_pages}"
+        )
+
+        loader = ThumbnailLoader([image_path], parent=self)
+        self._live_thumb_loaders.append(loader)
+        loader.thumbnail_ready.connect(self._apply_thumbnail)
+        loader.finished.connect(
+            lambda current_loader=loader: self._finish_live_thumbnail_loader(
+                current_loader
+            )
+        )
+        loader.start()
+
+    def _finish_live_thumbnail_loader(self, loader):
+        if loader in self._live_thumb_loaders:
+            self._live_thumb_loaders.remove(loader)
+        loader.deleteLater()
+
+    def _ensure_preview_visible(self, image_path: str):
+        widget_info = self._path_to_widget.get(image_path)
+        if not widget_info:
+            return
+        widget = widget_info.get("widget")
+        if widget is None:
+            return
+        pos_in_scroll = widget.mapTo(
+            self.preview_scroll_area.widget(), widget.rect().topLeft()
+        )
+        self.preview_scroll_area.ensureVisible(
+            pos_in_scroll.x(), pos_in_scroll.y(), widget.width(), widget.height()
+        )
+
     def scroll_preview_to_path(self, image_path: str):
         print(f"1111, {image_path}")
         widget_info = self._path_to_widget.get(image_path)
@@ -2334,6 +2388,8 @@ class ScanWindow(FramelessWindow):
                     message=f"扫描图像保存失败，已停止继续扫描: {save_error}",
                 )
                 return
+
+            self._show_scanned_page_immediately(save_path)
 
             if self._scan_stop_requested:
                 self._scan_stop_drain_deadline = (
