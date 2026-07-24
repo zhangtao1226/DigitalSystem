@@ -960,9 +960,13 @@ class SettingsDialog(QDialog):
             self.main_window.save_dir_path_label.setText(
                 f"保存路径: {self.path_edit.text()}"
             )
-            self.main_window.current_folder_path = (
-                f"{self.main_window.save_dir_path}/"
-                f"{self.main_window.save_dir_name}{self.main_window.serial_number}"
+            folder_name = self.main_window.save_dir_name
+            if self.main_window.is_checkbox:
+                folder_name = (
+                    f"{folder_name}-{self.main_window.serial_number}"
+                )
+            self.main_window.current_folder_path = os.path.join(
+                self.main_window.save_dir_path, folder_name
             )
 
             scan_config = {
@@ -1062,6 +1066,7 @@ class ScanWindow(FramelessWindow):
         self.total_scanned = 0
         self.total_pages = 0
         self.scan_mode = "单页扫描"
+        self._scan_target_ready = False
         self.is_scanning = False
 
         self.scanner_device = ""  # 扫描仪
@@ -1774,6 +1779,7 @@ class ScanWindow(FramelessWindow):
     def refresh_file_tree(self):
         if self.tree_root_path and os.path.exists(self.tree_root_path):
             self.update_file_tree_path(self.tree_root_path)
+            self.expand_file_tree_to_level(1)
         else:
             show_warning(self, "刷新失败", "根路径无效，请先在设置中指定保存路径")
 
@@ -1822,13 +1828,9 @@ class ScanWindow(FramelessWindow):
 
         if item_type == "folder":
             folder_name = os.path.basename(item_path)
-            if self.is_checkbox:
-                self.save_dir_name = folder_name[:-5]
-                self.serial_number = folder_name[-4:]
-            else:
-                self.save_dir_name = folder_name
-                self.serial_number = "0001"
-
+            # 手动选中的文件夹可以直接作为“持续扫描/F2”的保存目录，
+            # 但不反向修改设置中的文件夹名称和流水号。
+            self._scan_target_ready = True
             self.current_folder_path = item_path
             self.refresh_folder_info()
             self.load_folder_images(item_path)
@@ -1840,13 +1842,7 @@ class ScanWindow(FramelessWindow):
         elif item_type == "file":
             folder_path = os.path.dirname(item_path)
             folder_name = os.path.basename(folder_path)
-            if self.is_checkbox:
-                self.save_dir_name = folder_name[:-5]
-                self.serial_number = folder_name[-4:]
-            else:
-                self.save_dir_name = folder_name
-                self.serial_number = "0001"
-
+            self._scan_target_ready = False
             if self.current_folder_path != folder_path:
                 self.current_folder_path = folder_path
                 self.load_folder_images(folder_path)
@@ -1994,8 +1990,9 @@ class ScanWindow(FramelessWindow):
     def show_settings(self):
         dialog = SettingsDialog(self)
         if dialog.exec():
+            self._scan_target_ready = False
             self.update_file_tree_path(self.save_dir_path)
-            self.expand_file_tree_to_level(2)
+            self.expand_file_tree_to_level(1)
             if self.current_folder_path and os.path.exists(self.current_folder_path):
                 QTimer.singleShot(
                     100, lambda: self.select_tree_item_by_path(self.current_folder_path)
@@ -2032,28 +2029,43 @@ class ScanWindow(FramelessWindow):
                 return
 
         if self.is_checkbox:
-            son_dir_name = (
-                f"{self.save_dir_path}/{self.save_dir_name}-{self.serial_number}"
-            )
-            if os.path.exists(son_dir_name):
-                self.serial_number = f"{(int(self.serial_number) + 1):04d}"
+            try:
+                serial_number = int(self.serial_number or "0001")
+            except ValueError:
+                serial_number = 1
 
-            self.current_folder_path = (
-                f"{self.save_dir_path}/{self.save_dir_name}-{self.serial_number}"
-            )
+            while True:
+                serial_text = f"{serial_number:04d}"
+                target_path = os.path.join(
+                    self.save_dir_path, f"{self.save_dir_name}-{serial_text}"
+                )
+                if not os.path.exists(target_path):
+                    self.serial_number = serial_text
+                    self.current_folder_path = target_path
+                    break
+                serial_number += 1
         else:
-            self.current_folder_path = f"{self.save_dir_path}/{self.save_dir_name}"
+            self.current_folder_path = os.path.join(
+                self.save_dir_path, self.save_dir_name
+            )
 
         print(
             f"当前文件夹：{self.current_folder_path}; serial_number: {self.serial_number}"
         )
-        os.makedirs(self.current_folder_path, exist_ok=True)
+        folder_exists = os.path.isdir(self.current_folder_path)
+        if not folder_exists:
+            os.makedirs(self.current_folder_path, exist_ok=True)
 
-        self.update_file_tree_path(self.save_dir_path)
-        QTimer.singleShot(
-            150, lambda: self.select_tree_item_by_path(self.current_folder_path)
-        )
+        folder_item = self._ensure_tree_folder_item(self.current_folder_path)
+        if folder_item is not None:
+            self.file_tree.setCurrentItem(folder_item)
+            self.file_tree.scrollToItem(folder_item)
+            if folder_exists:
+                logger.info(f"扫描文件夹已存在，直接选中: {self.current_folder_path}")
+            else:
+                logger.info(f"扫描文件夹已创建并添加到目录树: {self.current_folder_path}")
 
+        self._scan_target_ready = True
         self.scan_fun()
 
     @Slot(str)
@@ -2061,7 +2073,6 @@ class ScanWindow(FramelessWindow):
         self.log_output.append(message)
 
     def scan_fun(self):
-
         # 校验当前扫描文件夹已保存扫描件数
         if os.path.exists(self.current_folder_path):
             current_folder_files_count = len(
@@ -2076,7 +2087,7 @@ class ScanWindow(FramelessWindow):
                 )
                 return
 
-        if not os.path.exists(self.current_folder_path):
+        if not self._scan_target_ready or not os.path.exists(self.current_folder_path):
             show_error(self, "错误提示", "请先点击开始扫描，然后才可以继续扫描")
             return
 
@@ -3196,6 +3207,37 @@ class ScanWindow(FramelessWindow):
                 folder_item, os.path.basename(file_path), file_path
             )
 
+    def _ensure_tree_folder_item(self, folder_path: str):
+        """在现有目录树中直接补充文件夹节点，并保留当前展开状态。"""
+        if not folder_path:
+            return None
+
+        root = self.file_tree.invisibleRootItem()
+
+        def _find_by_path(parent, target_path):
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                data = child.data(0, Qt.UserRole) or {}
+                if data.get("path") == target_path:
+                    return child
+                found = _find_by_path(child, target_path)
+                if found is not None:
+                    return found
+            return None
+
+        existing_item = _find_by_path(root, folder_path)
+        if existing_item is not None:
+            return existing_item
+
+        parent_path = os.path.dirname(folder_path)
+        parent_item = _find_by_path(root, parent_path)
+        if parent_item is None:
+            return None
+
+        return self._build_tree_item_folder(
+            parent_item, os.path.basename(folder_path), folder_path
+        )
+
     def _remove_preview_image(self, image_path: str):
         """局部移除单张预览，避免重新创建当前目录的全部缩略图。"""
         widget_entry = self._path_to_widget.pop(image_path, None)
@@ -3340,8 +3382,15 @@ class ScanWindow(FramelessWindow):
             show_warning(self, "提交警告", "暂无扫描文件可提交")
             return
 
+        selected_folder_name = (
+            os.path.basename(os.path.normpath(self.current_folder_path))
+            if self.current_folder_path
+            else "未选择"
+        )
         box = MessageBox(
-            "确认提交", f"确定要提交 {self.scan_files_count} 个扫描文件吗？", self
+            "确认提交",
+            f"确定要提交当前选中的文件夹【{selected_folder_name}】吗？",
+            self,
         )
         box.yesButton.setText("提交")
         box.cancelButton.setText("取消")
