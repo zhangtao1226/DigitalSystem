@@ -27,6 +27,12 @@ class BlankPageDetector:
         ink_pixel_rate_threshold=0.03,
         edge_pixel_rate_threshold=0.015,
         crop_margin_ratio=0.04,
+        duplex_mean_threshold=220,
+        duplex_std_threshold=28.0,
+        duplex_strong_dark_rate_threshold=0.002,
+        duplex_dark_rate_threshold=0.015,
+        duplex_ink_rate_threshold=0.10,
+        duplex_edge_rate_threshold=0.035,
     ):
         self.std_threshold = std_threshold
         self.mean_threshold_low = mean_threshold_low
@@ -35,8 +41,16 @@ class BlankPageDetector:
         self.ink_pixel_rate_threshold = ink_pixel_rate_threshold
         self.edge_pixel_rate_threshold = edge_pixel_rate_threshold
         self.crop_margin_ratio = crop_margin_ratio
+        self.duplex_mean_threshold = duplex_mean_threshold
+        self.duplex_std_threshold = duplex_std_threshold
+        self.duplex_strong_dark_rate_threshold = (
+            duplex_strong_dark_rate_threshold
+        )
+        self.duplex_dark_rate_threshold = duplex_dark_rate_threshold
+        self.duplex_ink_rate_threshold = duplex_ink_rate_threshold
+        self.duplex_edge_rate_threshold = duplex_edge_rate_threshold
 
-    def is_blank(self, image_path):
+    def is_blank(self, image_path, relaxed=False):
         img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             logger.error(f"无法读取图片: {image_path}")
@@ -47,9 +61,11 @@ class BlankPageDetector:
         std_val = np.std(img)
 
         dark_pixels = np.sum(img < 200)
+        strong_dark_pixels = np.sum(img < 170)
         ink_pixels = np.sum(img < 230)
         total_pixels = img.size
         dark_ratio = dark_pixels / total_pixels
+        strong_dark_ratio = strong_dark_pixels / total_pixels
         ink_ratio = ink_pixels / total_pixels
         edge_ratio = self._edge_ratio(img)
 
@@ -69,12 +85,28 @@ class BlankPageDetector:
             and edge_ratio < self.edge_pixel_rate_threshold
         )
 
-        is_blank_page = is_gray_blank or is_near_white_blank
+        # 双面扫描的空白背面可能带有纸张底色、边缘阴影或正面
+        # 文字的轻微透印。只对明确标记为背面页放宽阈值，同时使用
+        # 强黑像素比例保护真实文字、印章等有效内容。
+        is_duplex_back_blank = (
+            relaxed
+            and mean_val > self.duplex_mean_threshold
+            and std_val < self.duplex_std_threshold
+            and strong_dark_ratio < self.duplex_strong_dark_rate_threshold
+            and dark_ratio < self.duplex_dark_rate_threshold
+            and ink_ratio < self.duplex_ink_rate_threshold
+            and edge_ratio < self.duplex_edge_rate_threshold
+        )
+
+        is_blank_page = (
+            is_gray_blank or is_near_white_blank or is_duplex_back_blank
+        )
         logger.info(
             f"空白页检测: {os.path.basename(image_path)}; "
             f"mean={mean_val:.2f}; std={std_val:.2f}; "
-            f"dark={dark_ratio:.5f}; ink={ink_ratio:.5f}; "
-            f"edge={edge_ratio:.5f}; blank={is_blank_page}"
+            f"strong_dark={strong_dark_ratio:.5f}; dark={dark_ratio:.5f}; "
+            f"ink={ink_ratio:.5f}; edge={edge_ratio:.5f}; "
+            f"duplex_relaxed={relaxed}; blank={is_blank_page}"
         )
 
         return is_blank_page
@@ -107,6 +139,8 @@ class BlankPageDetector:
         target_files=None,
         filename_prefix=None,
         start_index=1,
+        renumber=True,
+        relaxed_files=None,
     ):
         if not os.path.isdir(dir_path):
             raise NotADirectoryError(f"扫描目录不存在: {dir_path}")
@@ -115,11 +149,14 @@ class BlankPageDetector:
         deleted = []
         kept_files = []
         errors = []
+        relaxed_names = {
+            os.path.basename(name) for name in (relaxed_files or [])
+        }
 
         for f_name in files:
             f_path = os.path.join(dir_path, f_name)
             try:
-                if self.is_blank(f_path):
+                if self.is_blank(f_path, relaxed=f_name in relaxed_names):
                     os.remove(f_path)
                     deleted.append(f_name)
                     logger.info(f"已删除空白页: {f_path}")
@@ -130,12 +167,14 @@ class BlankPageDetector:
                 errors.append({"file": f_name, "error": str(exc)})
                 kept_files.append(f_name)
 
-        rename = self._rename_in_order(
-            dir_path=dir_path,
-            files=kept_files,
-            filename_prefix=filename_prefix,
-            start_index=start_index,
-        )
+        rename = {}
+        if renumber:
+            rename = self._rename_in_order(
+                dir_path=dir_path,
+                files=kept_files,
+                filename_prefix=filename_prefix,
+                start_index=start_index,
+            )
         kept_after_rename = [rename.get(name, name) for name in kept_files]
 
         return {
@@ -146,6 +185,41 @@ class BlankPageDetector:
             "total_kept": len(kept_after_rename),
             "errors": errors,
         }
+
+    def renumber_files(
+        self,
+        dir_path,
+        files,
+        filename_prefix=None,
+        start_index=1,
+    ):
+        """不重复读取图片，仅按当前顺序连续重命名指定文件。"""
+        candidate_files = self._get_candidate_files(dir_path, files)
+        return self._rename_in_order(
+            dir_path=dir_path,
+            files=candidate_files,
+            filename_prefix=filename_prefix,
+            start_index=start_index,
+        )
+
+    def renumber_directory(
+        self,
+        dir_path,
+        filename_prefix=None,
+        start_index=1,
+    ):
+        """不执行空白检测，仅将目录内现有图片连续重排文件名。"""
+        candidate_files = self._get_candidate_files(dir_path)
+        return self._rename_in_order(
+            dir_path=dir_path,
+            files=candidate_files,
+            filename_prefix=filename_prefix,
+            start_index=start_index,
+        )
+
+    def list_image_files(self, dir_path):
+        """返回目录内按页码顺序排列的可处理图片文件名。"""
+        return self._get_candidate_files(dir_path)
 
     def _get_candidate_files(self, dir_path, target_files=None):
         if target_files is None:

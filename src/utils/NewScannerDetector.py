@@ -68,6 +68,12 @@ class ScanParams:
     scan_result: List = field(default_factory=list)
 
     def validate(self) -> None:
+        if self.scan_format not in (0, 1):
+            raise ValueError(
+                f"[ScanParams] scan_format={self.scan_format!r} 无效，"
+                "单面扫描必须为 0，双面扫描必须为 1"
+            )
+
         if not isinstance(self.dpi, int) or self.dpi <= 0:
             raise ValueError(f"[ScanParams] dpi={self.dpi} 无效， 必须为正整数")
 
@@ -105,6 +111,10 @@ class NewScannerDetector:
 
         # 停止扫描标志，线程安全
         self._stop_event: threading.Event = threading.Event()
+        # KODAK 的残余黑边处理优先使用驱动自定义 TWAIN 能力；驱动拒绝
+        # 时才创建软件清理器，并在同一批高速扫描中复用。
+        self._kodak_edge_fill_enabled = False
+        self._border_cleaner = None
 
     @property
     def is_connected(self) -> bool:
@@ -161,6 +171,7 @@ class NewScannerDetector:
 
                 self._scanner_name = self._source.GetSourceName()
                 self._is_connected = True
+                self._kodak_edge_fill_enabled = False
                 logger.info(f"成功连接扫描仪: {self._scanner_name}")
                 return
 
@@ -262,6 +273,14 @@ class NewScannerDetector:
         p = self._params
         src = self._source
 
+        # 高速 ADF 驱动（包括 KODAK i3000）会根据当前进纸模式动态开放
+        # 自动裁边等图像处理能力，因此必须先启用进纸器，再设置图像能力。
+        if p.auto_feed:
+            self._try_set_cap(twain.CAP_FEEDERENABLED, twain.TWTY_BOOL, True, "开启进纸器")
+            self._try_set_cap(twain.CAP_AUTOFEED, twain.TWTY_BOOL, True, "开启自动进纸")
+            self._try_set_cap(twain.CAP_AUTOSCAN, twain.TWTY_BOOL, True, "开启自动扫描")
+            self._try_set_cap(twain.CAP_XFERCOUNT, twain.TWTY_INT16, -1, "设置连续扫描")
+
         native_xfer = getattr(twain, "TWSX_NATIVE", 0)
         self._try_set_cap(
             twain.ICAP_XFERMECH,
@@ -272,43 +291,200 @@ class NewScannerDetector:
         src.set_capability(twain.ICAP_XRESOLUTION, twain.TWTY_FIX32, float(p.dpi))
         src.set_capability(twain.ICAP_YRESOLUTION, twain.TWTY_FIX32, float(p.dpi))
 
-        src.set_capability(twain.CAP_DUPLEXENABLED, twain.TWTY_BOOL, p.scan_format)
+        self._set_duplex_mode(p.scan_format)
 
         src.set_capability(twain.ICAP_PIXELTYPE, twain.TWTY_UINT16, _COLOR_MODE_MAP[p.color_mode])
 
         src.set_capability(twain.ICAP_ROTATION, twain.TWTY_FIX32, _ROTATION_MAP[p.rotation])
 
-        if p.deskew:
-            try:
-                self._try_set_cap(twain.ICAP_AUTOMATICDESKEW, twain.TWTY_BOOL, True, "自动纠偏")
-            except twain.exceptions.excTWCC_UNKNOWN as tee:
-                logger.warning(f"不支持自动纠偏; {tee}")
+        # TWAIN 规范要求自动边界检测/自动旋转与“未定义图像尺寸”配套使用。
+        # 仅设置 ICAP_AUTOMATICBORDERDETECTION 时，部分 KODAK 驱动虽然不报错，
+        # 但仍按固定纸张幅面输出，从而在页面边缘保留黑边。
+        needs_undefined_size = p.remove_black_border or p.deskew
+        undefined_size_cap = getattr(twain, "ICAP_UNDEFINEDIMAGESIZE", 0x112D)
+        undefined_size_enabled = self._try_set_cap(
+            undefined_size_cap,
+            twain.TWTY_BOOL,
+            needs_undefined_size,
+            "接收自动检测后的可变图像尺寸",
+        )
 
-            try:
-                self._try_set_cap(twain.ICAP_AUTOMATICROTATE, twain.TWTY_BOOL, True, "自动旋转")
-            except twain.exceptions.excTWCC_UNKNOWN as tee:
-                logger.warning(f"不支持自动旋转; {tee}")
-
+        border_detection_enabled = False
         if p.remove_black_border:
-            try:
-                self._try_set_cap(twain.ICAP_AUTOMATICBORDERDETECTION, twain.TWTY_BOOL, True, "自动去黑边")
-            except twain.exceptions.excTWCC_UNKNOWN as tee:
-                logger.warning(f"不支持自动去黑边; {tee}")
+            border_detection_enabled = self._try_set_cap(
+                getattr(twain, "ICAP_AUTOMATICBORDERDETECTION", 0x1150),
+                twain.TWTY_BOOL,
+                True,
+                "自动检测页面边界并去黑边",
+            )
 
-        if p.auto_feed:
-            self._try_set_cap(twain.CAP_FEEDERENABLED, twain.TWTY_BOOL, True, "开启进纸器")
-            self._try_set_cap(twain.CAP_AUTOFEED, twain.TWTY_BOOL, True, "开启自动进纸")
-            self._try_set_cap(twain.CAP_AUTOSCAN, twain.TWTY_BOOL, True, "开启自动扫描")
-            self._try_set_cap(twain.CAP_XFERCOUNT, twain.TWTY_INT16, -1, "设置连续扫描")
+        if p.deskew:
+            self._try_set_cap(
+                getattr(twain, "ICAP_AUTOMATICDESKEW", 0x1151),
+                twain.TWTY_BOOL,
+                True,
+                "自动检测并纠偏",
+            )
+            self._try_set_cap(
+                getattr(twain, "ICAP_AUTOMATICROTATE", 0x1152),
+                twain.TWTY_BOOL,
+                True,
+                "自动旋转",
+            )
+
+        auto_size_enabled = False
+        if p.remove_black_border:
+            auto_size_enabled = self._try_set_cap(
+                getattr(twain, "ICAP_AUTOSIZE", 0x1156),
+                twain.TWTY_UINT16,
+                getattr(twain, "TWAS_AUTO", 1),
+                "按文档实际边界自动确定图像尺寸",
+            )
+            self._try_set_cap(
+                getattr(twain, "ICAP_AUTOMATICLENGTHDETECTION", 0x1158),
+                twain.TWTY_BOOL,
+                True,
+                "自动检测文档长度",
+            )
+            if undefined_size_enabled and (
+                border_detection_enabled or auto_size_enabled
+            ):
+                logger.info("已启用扫描仪标准自动边界检测")
+            else:
+                logger.warning(
+                    "扫描仪未完整接受自动裁边能力，请确认 KODAK TWAIN 驱动中"
+                    "“文档=自动检测并纠偏、图像=整个文档”可用"
+                )
+
+            if self._is_kodak_scanner():
+                self._apply_kodak_border_settings()
+
+        # KODAK 的正反面图像处理参数可能重新加载摄像头配置，因此所有
+        # 自定义能力下发完成后再次锁定并校验最终单双面状态。
+        self._set_duplex_mode(p.scan_format)
+
+    def _set_duplex_mode(self, scan_format: int) -> None:
+        duplex_enabled = scan_format == 1
+        mode_text = "双面扫描" if duplex_enabled else "单面扫描"
+        cap_id = getattr(twain, "CAP_DUPLEXENABLED", 0x1013)
+
+        if not self._try_set_cap(
+            cap_id,
+            twain.TWTY_BOOL,
+            duplex_enabled,
+            f"设置{mode_text}",
+        ):
+            raise RuntimeError(f"扫描仪未接受{mode_text}设置，已取消本次扫描")
+
+        current = self._get_cap_current_value(cap_id)
+        if current is not None and bool(current) != duplex_enabled:
+            current_text = "双面扫描" if bool(current) else "单面扫描"
+            raise RuntimeError(
+                f"扫描仪当前仍为{current_text}，无法切换到{mode_text}，"
+                "已取消本次扫描"
+            )
+
+        logger.info(
+            f"扫描方式已确认: {mode_text}; "
+            f"CAP_DUPLEXENABLED={duplex_enabled}"
+        )
+
+    def _is_kodak_scanner(self) -> bool:
+        scanner_name = (self._scanner_name or "").casefold()
+        return "kodak" in scanner_name or "alaris" in scanner_name
+
+    def _apply_kodak_border_settings(self) -> None:
+        """
+        启用 KODAK 文档扫描仪驱动自带的残余边框处理。
+
+        这些能力来自 KODAK Document Scanner TWAIN 自定义能力定义：
+        - ICAP_CROPPINGMODE 0x8022 / TWCR_AGGRESSIVEAUTOCROP 3
+        - ICAP_IMAGEEDGEFILL 0x8095 / TWIE_AUTOMATIC 3
+        """
+        # KODAK 的部分图像能力按正反面摄像头分别保存；关闭“正反面设置
+        # 不同”后，本次设置会同时应用到单面及双面扫描。
+        self._try_set_cap(
+            0x80B7,  # CAP_SIDESDIFFERENT
+            twain.TWTY_BOOL,
+            False,
+            "KODAK 正反面使用相同图像处理参数",
+        )
+        aggressive_crop_enabled = self._try_set_cap(
+            0x8022,  # ICAP_CROPPINGMODE
+            twain.TWTY_UINT16,
+            3,  # TWCR_AGGRESSIVEAUTOCROP
+            "KODAK 强力自动裁切",
+        )
+        self._kodak_edge_fill_enabled = self._try_set_cap(
+            0x8095,  # ICAP_IMAGEEDGEFILL
+            twain.TWTY_UINT16,
+            3,  # TWIE_AUTOMATIC
+            "KODAK 自动图像边缘填充",
+        )
+
+        if aggressive_crop_enabled and self._kodak_edge_fill_enabled:
+            logger.info("KODAK i3000 驱动级去黑边已启用（强力裁切 + 自动边缘填充）")
+        elif self._kodak_edge_fill_enabled:
+            logger.info("KODAK 自动图像边缘填充已启用")
+        else:
+            logger.warning(
+                "KODAK 驱动未接受自动图像边缘填充，将使用扫描图片残余黑边清理"
+            )
 
 
     def _try_set_cap(self, cap_id: int, cap_type: int, value, desc:str = "") -> bool:
+        if cap_id is None:
+            logger.warning(f"当前 TWAIN 库未定义{desc}能力, 已跳过")
+            return False
+
         try:
             self._source.set_capability(cap_id, cap_type, value)
+            current = self._get_cap_current_value(cap_id)
+            if current is None:
+                logger.info(f"{desc}已下发到扫描仪")
+            else:
+                logger.info(f"{desc}已生效，驱动当前值: {current!r}")
             return True
         except Exception as exc:
-            logger.warning(f"设备不支持{desc}, 已跳过（原因：{str(exc)}）")
+            # 部分 TWAIN 驱动会在接受设置后返回 CHECKSTATUS。读取当前值，
+            # 若已经等于目标值，就不能把它误判为“不支持”。
+            current = self._get_cap_current_value(cap_id)
+            if self._cap_value_matches(current, value):
+                logger.info(
+                    f"{desc}已由驱动接受（返回状态: {exc}），当前值: {current!r}"
+                )
+                return True
+            logger.warning(f"设备不支持{desc}, 已跳过（原因：{exc!r}）")
             return False
+
+    def _get_cap_current_value(self, cap_id: int):
+        getter = getattr(self._source, "get_capability_current", None)
+        if not callable(getter):
+            return None
+
+        try:
+            result = getter(cap_id)
+        except Exception as exc:
+            logger.debug(f"读取 TWAIN 能力 {cap_id:#06x} 当前值失败: {exc}")
+            return None
+
+        # pytwain 返回 (TWTY_*, value)，这里提取实际的当前值。
+        if isinstance(result, tuple) and len(result) == 2:
+            return result[1]
+        if isinstance(result, dict):
+            return result.get("CurrentValue")
+        return result
+
+    @staticmethod
+    def _cap_value_matches(current, expected) -> bool:
+        if current is None:
+            return False
+        if isinstance(expected, bool):
+            try:
+                return bool(current) is expected
+            except (TypeError, ValueError):
+                return False
+        return current == expected
 
     def request_feeder_stop(self) -> bool:
         self._stop_event.set()
@@ -501,6 +677,8 @@ class NewScannerDetector:
                 with Image.open(tmp_path) as img:
                     img.load()
                     self._write_image(img, save_path, ext, p)
+                if p.remove_black_border and not self._kodak_edge_fill_enabled:
+                    self._clean_residual_black_border(save_path)
             finally:
                 try:
                     os.remove(tmp_path)
@@ -510,6 +688,37 @@ class NewScannerDetector:
             raise
         except Exception as exc:
             raise OSError(f"扫描图像保存失败; {save_path}: {exc}") from exc
+
+    def _clean_residual_black_border(self, image_path: str) -> None:
+        """
+        清理由扫描仪自动裁边后残留在页面四周的窄黑边。
+
+        当设备不支持 KODAK 自定义自动边缘填充时，复用项目现有的边缘
+        连通块算法，只检查靠近图片边缘的区域，并保护红章等高色差内容。
+        清理失败时保留驱动原始扫描件，不中断高速扫描批次。
+        """
+        try:
+            if self._border_cleaner is None:
+                from src.utils.DocumentBorderCleaner import DocumentBorderCleaner
+
+                # KODAK 官方 Border Remove 处理约 0.1 英寸的残余边框。
+                # 300 DPI 时约为 30 像素，2.5% 的检测带足以覆盖常用
+                # A4/A3 扫描尺寸，同时避免深入正文区域。
+                self._border_cleaner = DocumentBorderCleaner(
+                    scan_limit=0.025,
+                    padding=3,
+                    shadow_expand=5,
+                )
+
+            self._border_cleaner.clean(
+                input_path=image_path,
+                output_path=image_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"扫描图片残余黑边清理失败，已保留原始图片: "
+                f"{os.path.basename(image_path)}; 原因: {exc!r}"
+            )
 
     @staticmethod
     def _write_image(img: Image.Image, path: str, ext: str, p:"ScanParams") -> None:
