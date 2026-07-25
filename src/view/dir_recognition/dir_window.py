@@ -6,6 +6,7 @@
 # @Software  : PyCharm
 import json
 import os
+import queue
 import shutil
 import sys
 import tempfile
@@ -35,6 +36,7 @@ from PySide6.QtGui import (
     QPainter,
     QPalette,
     QPixmap,
+    QKeySequence,
     QTransform,
 )
 from PySide6.QtWidgets import (
@@ -94,6 +96,87 @@ from src.services.task_service import task_service
 from src.utils.LoggerDetector import logger
 from src.utils.NotificationTool import show_error, show_info, show_success, show_warning
 from src.view.common.NavigationLabel import NavigationLabel
+from src.view.common.CommonProgressBar import CommonProgressDialog
+
+
+class DirectoryOCRThread(QThread):
+    """在同一个持久线程中完成 OCR 模型加载和后续识别。"""
+
+    model_ready = Signal()
+    model_failed = Signal(str)
+    recognition_finished = Signal(str, str)
+    recognition_failed = Signal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.is_model_ready = False
+        self.load_error = ""
+        self._tasks = queue.Queue()
+        self._detector = None
+
+    def run(self):
+        try:
+            from src.utils.OCRDetector import OCRDetector
+
+            self._detector = OCRDetector()
+            self.is_model_ready = True
+            self.load_error = ""
+            self.model_ready.emit()
+            logger.info("目录识别 OCR 模型已在后台线程预热完成")
+        except Exception as exc:
+            self.is_model_ready = False
+            self.load_error = str(exc)
+            logger.exception(f"OCR预热模型失败：{exc}")
+            self.model_failed.emit(self.load_error)
+            return
+
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                break
+
+            request_id, image_path = task
+            try:
+                result = self._detector.detect(image_path) or []
+                text_result = "".join(str(item) for item in result)
+                self.recognition_finished.emit(request_id, text_result)
+            except Exception as exc:
+                logger.exception(f"OCR识别失败：{exc}")
+                self.recognition_failed.emit(request_id, str(exc))
+
+        self._detector = None
+        self.is_model_ready = False
+
+    def recognize(self, request_id, image_path):
+        if not self.is_model_ready or not self.isRunning():
+            raise RuntimeError("OCR模型尚未加载完成，请稍后再试")
+        self._tasks.put((request_id, image_path))
+
+    def stop(self):
+        if self.isRunning():
+            self._tasks.put(None)
+
+
+_directory_ocr_thread = None
+
+
+def get_directory_ocr_thread():
+    """获取应用生命周期内复用的目录识别 OCR 工作线程。"""
+    global _directory_ocr_thread
+
+    if (
+        _directory_ocr_thread is None
+        or (
+            not _directory_ocr_thread.isRunning()
+            and not _directory_ocr_thread.is_model_ready
+        )
+    ):
+        _directory_ocr_thread = DirectoryOCRThread()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(_directory_ocr_thread.stop)
+
+    return _directory_ocr_thread
 
 
 class ImageDirectoryTree(CardWidget):
@@ -204,15 +287,14 @@ class ImageDirectoryTree(CardWidget):
             root_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
             self.load_subdirectories(root_item, dir_path, current_level=1)
 
-        self.expand_to_level(self.default_expand_levels)
+        self.tree_widget.collapseAll()
 
         if self.tree_widget.topLevelItemCount() > 0:
             root_item = self.tree_widget.topLevelItem(0)
-            first_item = root_item.child(0) if root_item.childCount() > 0 else root_item
-            first_item.setSelected(True)
-            self.selected_folder_item = first_item
-            self.current_selected_folder = first_item.data(0, Qt.UserRole)
-            self.tree_widget.scrollToItem(first_item)
+            root_item.setSelected(True)
+            self.selected_folder_item = root_item
+            self.current_selected_folder = root_item.data(0, Qt.UserRole)
+            self.tree_widget.scrollToItem(root_item)
 
     def expand_to_level(self, max_level):
         def _expand(item, level):
@@ -260,6 +342,73 @@ class ImageDirectoryTree(CardWidget):
         if style:
             return style.standardIcon(QStyle.SP_DirIcon)
         return QIcon()
+
+    @staticmethod
+    def _normalized_folder_path(folder_path):
+        return os.path.normcase(os.path.abspath(os.path.normpath(folder_path)))
+
+    def find_folder_item(self, folder_path):
+        """根据完整路径查找现有目录树节点。"""
+        if not folder_path:
+            return None
+
+        target_path = self._normalized_folder_path(folder_path)
+        root = self.tree_widget.invisibleRootItem()
+
+        def _search(parent_item):
+            for index in range(parent_item.childCount()):
+                child_item = parent_item.child(index)
+                child_path = child_item.data(0, Qt.UserRole)
+                if (
+                    child_path
+                    and self._normalized_folder_path(child_path) == target_path
+                ):
+                    return child_item
+                matched_item = _search(child_item)
+                if matched_item is not None:
+                    return matched_item
+            return None
+
+        return _search(root)
+
+    def add_folder_item(self, parent_folder_path, folder_path):
+        """
+        只向指定父节点增加一个新文件夹，不清空或重建整棵目录树。
+
+        已存在同路径节点时直接复用，保持当前选择、展开状态和滚动位置。
+        """
+        if not parent_folder_path or not folder_path:
+            return None
+
+        existing_item = self.find_folder_item(folder_path)
+        if existing_item is not None:
+            return existing_item
+
+        parent_item = self.find_folder_item(parent_folder_path)
+        if parent_item is None:
+            logger.warning(
+                f"增量更新目录树失败，未找到父节点: {parent_folder_path}"
+            )
+            return None
+
+        folder_name = os.path.basename(os.path.normpath(folder_path))
+        child_item = QTreeWidgetItem()
+        child_item.setText(0, folder_name)
+        child_item.setData(0, Qt.UserRole, folder_path)
+        child_item.setIcon(0, self.get_folder_icon())
+        child_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+
+        insert_index = parent_item.childCount()
+        for index in range(parent_item.childCount()):
+            existing_name = parent_item.child(index).text(0).lstrip("⚑ ").lower()
+            if folder_name.lower() < existing_name:
+                insert_index = index
+                break
+
+        parent_item.insertChild(insert_index, child_item)
+        parent_item.setExpanded(True)
+        logger.info(f"目录树已增量添加分件文件夹: {folder_path}")
+        return child_item
 
     def set_folder_mark_state(self, folder_path: str, has_mark: bool):
         """
@@ -485,29 +634,44 @@ class DirWindow(FramelessWindow):
             settings.archives_template_path,
             sheet_name=f"{self.register_info.archive_type}-{self.archives_unit}",
         )
+        field_column = "别名"
+        if self.register_info.archive_type == "合同档案":
+            contract_fields = {
+                self._safe_text(value).strip()
+                for value in self.df.get("字段名", pd.Series(dtype=str)).tolist()
+            }
+            alias_fields = {
+                self._safe_text(value).strip()
+                for value in self.df.get("别名", pd.Series(dtype=str)).tolist()
+            }
+            if "合同编号" in contract_fields and "合同编号" not in alias_fields:
+                field_column = "字段名"
+
         self.fields = []
         for indes, series in self.df.iterrows():
-            field_name = series.iloc[2]
+            field_name = self._safe_text(series.get(field_column, "")).strip()
             field_required = series.iloc[5]
-            self.fields.append((field_name, f"请输入{field_name}", field_required))
+            if field_name:
+                self.fields.append((field_name, f"请输入{field_name}", field_required))
+        self.identifier_field_name = self._get_identifier_field_name()
+        self.title_field_name = self._get_title_field_name()
         # print(f"档案字段信息: {self.fields}")
         self._is_navigation = False
         self._is_app_exiting = False
-
-        self.parts_files_image = []
 
         # ── 标记气泡计数（当前任务未修复标记总数）──
         self._mark_total_count = 0
 
         self.ocr_detector = None
+        self._ocr_worker = None
+        self._ocr_progress_dialog = None
+        self._ocr_pending_requests = {}
 
         # 1. 先建好界面组件，窗口立即显示
         self.init_ui()
 
-        # 2. 窗口显示后，在【主线程】空闲时再加载 OCR
-        #    PaddleOCR 的 C++ 引擎非线程安全，必须在主线程构造和使用，
-        #    否则会触发 0xC0000005 访问违例。这里用 QTimer 延迟加载，
-        #    既不阻塞窗口启动，又避免跨线程构造 Paddle。
+        # 2. 窗口显示后启动持久 OCR 工作线程。模型构造和后续识别始终在
+        #    同一后台线程中执行，既保持界面响应，也避免跨线程调用模型。
         QTimer.singleShot(0, self._load_ocr)
 
     @staticmethod
@@ -519,16 +683,81 @@ class DirWindow(FramelessWindow):
         return field_name == "题名" or "责任" in field_name
 
     def _load_ocr(self):
-        """在主线程加载 OCR 模型（延迟执行，不阻塞窗口启动）。"""
-        try:
-            from src.utils.OCRDetector import OCRDetector
+        """连接或启动持久 OCR 工作线程，首次加载时显示响应式进度框。"""
+        self._ocr_worker = get_directory_ocr_thread()
+        self._ocr_worker.model_ready.connect(self._on_ocr_model_ready)
+        self._ocr_worker.model_failed.connect(self._on_ocr_model_failed)
+        self._ocr_worker.recognition_finished.connect(
+            self._on_ocr_recognition_finished
+        )
+        self._ocr_worker.recognition_failed.connect(self._on_ocr_recognition_failed)
 
-            self.ocr_detector = OCRDetector()
-            logger.info("OCR模型预热完成")
-        except Exception as e:
-            self.ocr_detector = None
-            logger.exception(f"OCR预热模型失败： {e}")
-            show_warning(self, "提示", "OCR 模型加载失败， 识别功能可能不可用")
+        if self._ocr_worker.is_model_ready:
+            self.ocr_detector = self._ocr_worker
+            logger.info("复用已预热的目录识别 OCR 模型")
+            return
+
+        self._ocr_progress_dialog = CommonProgressDialog(
+            title="OCR模型预热",
+            message="首次进入目录识别，正在加载OCR模型，请稍候...",
+            show_cancel=False,
+            parent=self,
+        )
+        self._ocr_progress_dialog.set_indeterminate()
+        self._ocr_progress_dialog.show()
+        self._ocr_progress_dialog.raise_()
+
+        if not self._ocr_worker.isRunning():
+            self._ocr_worker.start()
+
+    def _close_ocr_progress_dialog(self):
+        if self._ocr_progress_dialog is None:
+            return
+        self._ocr_progress_dialog.close()
+        self._ocr_progress_dialog.deleteLater()
+        self._ocr_progress_dialog = None
+
+    def _on_ocr_model_ready(self):
+        self.ocr_detector = self._ocr_worker
+        self._close_ocr_progress_dialog()
+        logger.info("OCR模型预热完成，目录识别功能已就绪")
+
+    def _on_ocr_model_failed(self, error_message):
+        self.ocr_detector = None
+        self._close_ocr_progress_dialog()
+        show_warning(
+            self,
+            "提示",
+            f"OCR模型加载失败，识别功能可能不可用：{error_message}",
+        )
+
+    def _get_identifier_field_name(self):
+        field_names = {field[0] for field in self.fields}
+        if self.register_info.archive_type == "合同档案":
+            for candidate in ("合同编号", "bh"):
+                if candidate in field_names:
+                    return candidate
+        for candidate in ("档号", "dh"):
+            if candidate in field_names:
+                return candidate
+        return "合同编号" if self.register_info.archive_type == "合同档案" else "档号"
+
+    def _get_title_field_name(self):
+        field_names = {field[0] for field in self.fields}
+        candidates = (
+            ("合同名称", "tm", "题名")
+            if self.register_info.archive_type == "合同档案"
+            else ("题名", "tm", "合同名称")
+        )
+        return next((name for name in candidates if name in field_names), candidates[0])
+
+    def _apply_contract_date_default(self):
+        """合同档案的登记日期为空时，默认填写当天日期。"""
+        if self.register_info.archive_type != "合同档案":
+            return
+        date_edit = self.field_inputs.get("登记日期")
+        if date_edit is not None and not date_edit.text().strip():
+            date_edit.setText(datetime.now().strftime("%Y-%m-%d"))
 
     def _get_valid_image_paths(self):
         valid_paths = []
@@ -829,7 +1058,9 @@ class DirWindow(FramelessWindow):
         page_control_layout = QHBoxLayout()
         page_control_layout.setSpacing(15)
         page_control_layout.setContentsMargins(0, 0, 0, 0)
-        self.prev_btn = PushButton("上一页", self)
+        self.prev_btn = PushButton("上一页/Alt+Q", self)
+        self.prev_btn.setShortcut(QKeySequence("Alt+Q"))
+        self.prev_btn.setToolTip("上一页（Alt+Q）")
         self.prev_btn.clicked.connect(self.prev_page)
         self.prev_btn.setEnabled(self.total_images > 1)
         page_label = QLabel("页码:")
@@ -856,7 +1087,9 @@ class DirWindow(FramelessWindow):
         self.page_input.returnPressed.connect(self.jump_to_page_by_lineedit)
         self.total_page_label = QLabel(f"/ {self.total_images}")
         self.total_page_label.setStyleSheet("font-size:16px; color: #666;")
-        self.next_btn = PushButton("下一页", self)
+        self.next_btn = PushButton("下一页/Alt+W", self)
+        self.next_btn.setShortcut(QKeySequence("Alt+W"))
+        self.next_btn.setToolTip("下一页（Alt+W）")
         self.next_btn.clicked.connect(self.next_page)
         self.next_btn.setEnabled(self.total_images > 1)
 
@@ -886,7 +1119,7 @@ class DirWindow(FramelessWindow):
         for btn in [self.prev_btn, self.next_btn]:
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFont(QFont("Microsoft YaHei", 13))
-            btn.setFixedSize(110, 40)
+            btn.setFixedSize(150, 40)
             btn.setStyleSheet(nav_btn_style)
 
         page_control_layout.addWidget(self.prev_btn)
@@ -897,7 +1130,9 @@ class DirWindow(FramelessWindow):
         function_btn_layout = QHBoxLayout()
         function_btn_layout.setSpacing(16)
         function_btn_layout.setContentsMargins(0, 0, 0, 0)
-        self.save_btn = PrimaryPushButton("保存", self)
+        self.save_btn = PrimaryPushButton("保存/Alt+S", self)
+        self.save_btn.setShortcut(QKeySequence("Alt+S"))
+        self.save_btn.setToolTip("保存目录（Alt+S）")
         self.save_btn.setStyleSheet("""
             PrimaryPushButton {
                 border-radius: 8px;
@@ -912,8 +1147,10 @@ class DirWindow(FramelessWindow):
                 background-color: #0052a3;
             }
         """)
-        self.save_btn.clicked.connect(self.save_catalog)
-        self.clear_selection_btn = PushButton("重置", self)
+        self.save_btn.clicked.connect(lambda: self.save_catalog())
+        self.clear_selection_btn = PushButton("重置/Alt+R", self)
+        self.clear_selection_btn.setShortcut(QKeySequence("Alt+R"))
+        self.clear_selection_btn.setToolTip("重置目录（Alt+R）")
         self.clear_selection_btn.clicked.connect(self.reset_fun)
         self.clear_selection_btn.setStyleSheet("""
             PushButton {
@@ -933,8 +1170,10 @@ class DirWindow(FramelessWindow):
                 border-color: #66b3ff;
             }
         """)
-        self.parts_btn = PushButton("分件", self)
-        self.parts_btn.clicked.connect(self.parts_files)
+        self.parts_btn = PushButton("分件/Alt+E", self)
+        self.parts_btn.setShortcut(QKeySequence("Alt+E"))
+        self.parts_btn.setToolTip("保存目录并分件（Alt+E）")
+        self.parts_btn.clicked.connect(self.save_and_parts)
         self.parts_btn.setStyleSheet("""
             PushButton {
                 border-radius: 8px;
@@ -1058,7 +1297,7 @@ class DirWindow(FramelessWindow):
 
             edit.setPlaceholderText(placeholder)
 
-            if label_text == "档号":
+            if label_text == self.identifier_field_name:
                 edit.textChanged.connect(self._on_doc_number_changed)
 
             self.field_inputs[label_text] = edit
@@ -1078,6 +1317,7 @@ class DirWindow(FramelessWindow):
         self.update_image_display()
         self.update_user_label()
         self.update_value()
+        self._apply_contract_date_default()
         # if self.directior_data_list:
         #     self.load_director_value(self.directior_data_list[0])
 
@@ -1090,7 +1330,10 @@ class DirWindow(FramelessWindow):
         if new_text == old_text:
             return
 
-        print(f"档号已修改: 原值={old_text!r}, 新值={new_text!r}")
+        print(
+            f"{self.identifier_field_name}已修改: "
+            f"原值={old_text!r}, 新值={new_text!r}"
+        )
         self.doc_number = new_text
 
         where = {
@@ -1111,14 +1354,15 @@ class DirWindow(FramelessWindow):
             for field, edit in self.field_inputs.items():
                 value = self._safe_text(director_info.get(field, ""))
                 print(f"value: {value}")
-                if field == "档号":
+                if field == self.identifier_field_name:
                     continue
                 edit.setText(value)
         else:
             for field, edit in self.field_inputs.items():
-                if field == "档号":
+                if field == self.identifier_field_name:
                     continue
                 edit.setText("")
+        self._apply_contract_date_default()
 
     def _check_task_status(self):
         self.can_do_task = None
@@ -1180,49 +1424,130 @@ class DirWindow(FramelessWindow):
         for field, edit in self.field_inputs.items():
             value = self._safe_text(director_info.get(field, ""))
             edit.setText(value)
-            if field == "档号":
+            if field == self.identifier_field_name:
                 self._original_doc_number = value
+        self._apply_contract_date_default()
+
+    def _clear_catalog_fields(self):
+        for edit in self.field_inputs.values():
+            edit.setText("")
+        self.doc_number = ""
+        self._original_doc_number = ""
+        self.current_focused_field = None
+        self.clear_image_selection()
+        self.update_field_labels_highlight()
+        self._apply_contract_date_default()
 
     def reset_fun(self):
         try:
-            for key, value in self.field_inputs.items():
-                print(f"{key}: {value}")
-                value.setText("")
-
+            self._clear_catalog_fields()
             show_success(self, "重置成功", "目录重置完成!")
         except Exception as e:
             show_error(self, "重置报错", f"目录重置失败: {str(e)}")
 
+    def save_and_parts(self):
+        """分件前先保存当前目录，保存成功后再移动图片并清空目录字段。"""
+        if self._get_part_file_count() <= 0:
+            show_warning(self, "分件失败", "当前页之前没有可分件的图片")
+            return
+        if not self.save_catalog(show_message=False, clear_fields=False):
+            return
+        if self.parts_files():
+            self._clear_catalog_fields()
+
+    def _get_part_file_count(self):
+        if self.total_images <= 0 or not self.image_paths:
+            return 0
+        if self.current_page >= self.total_images:
+            return self.total_images
+        return max(0, self.current_page - 1)
+
     def parts_files(self):
+        if not self.current_folder_path:
+            show_warning(self, "分件失败", "请先选择需要分件的文件夹")
+            return False
+        if not self.doc_number:
+            show_warning(
+                self,
+                "分件失败",
+                f"请先填写{self.identifier_field_name}",
+            )
+            return False
 
-        if self.current_page == self.total_images:
-            pages = self.current_page
-            self.parts_files_image.append(self.current_image_path)
-        else:
-            pages = self.current_page - 1
+        pages = self._get_part_file_count()
+        if pages <= 0:
+            show_warning(self, "分件失败", "当前页之前没有可分件的图片")
+            return False
 
-        print(f"parts_files: {len(self.parts_files_image)}")
         print(
             f"current_page: {self.current_page}; total_images: {self.total_images}; pages: {pages}"
         )
 
-        parts_folder = f"{self.current_folder_path}/{self.doc_number}"
+        parts_folder = os.path.join(self.current_folder_path, self.doc_number)
         os.makedirs(parts_folder, exist_ok=True)
         moved_paths = []
-        for image_path in self.parts_files_image[:pages]:
-            target_path = os.path.join(parts_folder, os.path.basename(image_path))
-            shutil.move(image_path, target_path)
-            moved_paths.append(image_path)
+        files_to_move = list(self.image_paths[:pages])
+        try:
+            for image_path in files_to_move:
+                target_path = os.path.join(parts_folder, os.path.basename(image_path))
 
-        show_success(self, "分件成功", f"分件文件夹已创建: {self.doc_number}")
+                if not os.path.isfile(image_path):
+                    # 上一次分件若在中途异常，文件可能已经成功移动到目标
+                    # 文件夹。将其视为已完成，避免重复移动时报不存在。
+                    if os.path.isfile(target_path):
+                        logger.info(f"分件文件已在目标目录，跳过重复移动: {target_path}")
+                        moved_paths.append(image_path)
+                        continue
+                    raise FileNotFoundError(f"分件源文件不存在: {image_path}")
 
-        self.parts_files_image.clear()
-        self.directory_tree.refresh_tree()
+                shutil.move(image_path, target_path)
+                moved_paths.append(image_path)
+        except Exception as exc:
+            self._refresh_after_parts_move(moved_paths)
+            self._add_parts_folder_to_tree(parts_folder)
+            logger.exception(
+                f"分件中断，计划移动 {pages} 页，已完成 {len(moved_paths)} 页: {exc}"
+            )
+            show_error(
+                self,
+                "分件失败",
+                f"计划移动 {pages} 页，已完成 {len(moved_paths)} 页；"
+                f"请检查文件后重试。\n原因：{exc}",
+            )
+            return False
 
-        # 从图片列表中移除已分件的图片, 并重置页码/总数
-        for image_path in moved_paths:
-            if image_path in self.image_paths:
-                self.image_paths.remove(image_path)
+        self._refresh_after_parts_move(moved_paths)
+        self._add_parts_folder_to_tree(parts_folder)
+
+        show_success(
+            self,
+            "保存并分件成功",
+            f"目录已保存，共移动 {len(moved_paths)} 页；"
+            f"分件文件夹已创建: {self.doc_number}",
+        )
+        return True
+
+    def _add_parts_folder_to_tree(self, parts_folder):
+        """分件后仅增量添加新文件夹节点，不刷新整棵目录树。"""
+        try:
+            added_item = self.directory_tree.add_folder_item(
+                self.current_folder_path, parts_folder
+            )
+            if added_item is None:
+                logger.warning(f"分件文件夹未能添加到目录树: {parts_folder}")
+        except Exception as exc:
+            logger.warning(f"增量添加分件文件夹失败: {parts_folder}; 原因: {exc}")
+
+    def _refresh_after_parts_move(self, moved_paths):
+        """移除已完成分件的页面，并统一从剩余第 1 页重新显示。"""
+        moved_keys = {
+            os.path.normcase(os.path.normpath(path)) for path in moved_paths
+        }
+        self.image_paths = [
+            path
+            for path in self.image_paths
+            if os.path.normcase(os.path.normpath(path)) not in moved_keys
+        ]
 
         self.total_images = len(self.image_paths)
         self.current_page = 1
@@ -1272,6 +1597,7 @@ class DirWindow(FramelessWindow):
             logger.warning(f"警告, 该文件夹下没有图片")
             for field, edit in self.field_inputs.items():
                 edit.setText("")
+            self._apply_contract_date_default()
             return
 
         self.doc_number = os.path.basename(self.current_folder_path)
@@ -1288,15 +1614,17 @@ class DirWindow(FramelessWindow):
             for field, edit in self.field_inputs.items():
                 value = self._safe_text(director_info.get(field, ""))
                 edit.setText(value)
-                if field == "档号":
+                if field == self.identifier_field_name:
                     self._original_doc_number = value
         else:
             for field, edit in self.field_inputs.items():
-                if field == "档号":
+                if field == self.identifier_field_name:
                     edit.setText(self.doc_number)
                     self._original_doc_number = self.doc_number
                 if field == "页数":
                     edit.setText(str(self.total_images))
+
+        self._apply_contract_date_default()
 
         # 切换目录后回显整棵目录树的标记状态 + 全局气泡计数
         self._restore_all_dir_marks()
@@ -1342,6 +1670,16 @@ class DirWindow(FramelessWindow):
             self.image_container.clear_selection()
             return
 
+        if self.ocr_detector is None:
+            show_warning(self, "OCR模型加载中", "OCR模型尚未加载完成，请稍后再试")
+            self.image_container.clear_selection()
+            return
+
+        if self._ocr_pending_requests:
+            show_warning(self, "OCR识别中", "当前选取区域正在识别，请稍候")
+            self.image_container.clear_selection()
+            return
+
         actual_display_rect = self.image_container.get_actual_display_rect()
         if not actual_display_rect.contains(selection_rect):
             show_warning(self, "选择区域无效", "请确保选择区域在图片显示范围内")
@@ -1355,13 +1693,6 @@ class DirWindow(FramelessWindow):
             self.image_container.clear_selection()
             return
 
-        show_info(
-            self,
-            "选择成功",
-            f"已选中图片区域中需要识别的区域，准备提取【{self.current_focused_field}】字段内容",
-            2000,
-        )
-
         if not self.current_focused_field:
             show_warning(self, "OCR识别失败", "请先选择要填充的输入框，再进行识别")
             return
@@ -1374,8 +1705,6 @@ class DirWindow(FramelessWindow):
         ):
             show_warning(self, "OCR识别失败", "请先在图片上选择有效的识别区域")
             return
-        show_info(self, "识别中", "正在处理选中区域，请稍候...", 2000)
-        QApplication.processEvents()
 
         temp_image_path = self.create_selected_temp_image()
         if not temp_image_path or not os.path.exists(temp_image_path):
@@ -1383,30 +1712,14 @@ class DirWindow(FramelessWindow):
             return
 
         try:
-            ocr_result = self.ocr_recognize_image(temp_image_path)
+            self.ocr_recognize_image(temp_image_path)
         except Exception as e:
             show_error(self, "OCR识别失败", f"识别过程中出现错误：{str(e)}")
             logger.error(f"识别过程中出现错误：{str(e)}")
+            self.clear_image_selection()
             return False
 
-        if self.current_focused_field in self.field_inputs:
-            current_text = self.field_inputs[self.current_focused_field].text()
-            if current_text:
-                new_text = f"{current_text} {ocr_result}"
-            else:
-                new_text = ocr_result
-
-            self.field_inputs[self.current_focused_field].setText(new_text)
-
-            show_success(
-                self,
-                "识别成功",
-                f"已将识别结果填充到【{self.current_focused_field[:10]}】字段\n识别内容：{ocr_result}",
-                2000,
-            )
-            logger.info(f"OCR识别成功; 识别内容：{ocr_result}")
-
-            QTimer.singleShot(1000, self.clear_image_selection)
+        return True
 
     def create_selected_temp_image(self):
         self.clean_temp_images()
@@ -1499,17 +1812,53 @@ class DirWindow(FramelessWindow):
         field = self.current_focused_field
         print(f"page: {page}, field: {field}")
 
-        if self.ocr_detector is None:
-            print("初始化OCR")
-            # from src.utils.OCRDetector import OCRDetector
-            print(111)
-            raise RuntimeError("OCR模型尚未加载完成， 请稍后再试")
-            # self.ocr_detector = OCRDetector()
-            # print(2222)
+        if self._ocr_worker is None or not self._ocr_worker.is_model_ready:
+            raise RuntimeError("OCR模型尚未加载完成，请稍后再试")
 
-        result = self.ocr_detector.detect(image_path) or []
-        print(f"result: {result}")
-        return "".join(str(item) for item in result)
+        request_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        self._ocr_pending_requests[request_id] = {
+            "field": field,
+            "image_path": image_path,
+        }
+        try:
+            self._ocr_worker.recognize(request_id, image_path)
+        except Exception:
+            self._ocr_pending_requests.pop(request_id, None)
+            raise
+        return request_id
+
+    def _on_ocr_recognition_finished(self, request_id, ocr_result):
+        request_info = self._ocr_pending_requests.pop(request_id, None)
+        if request_info is None:
+            return
+
+        field_name = request_info.get("field")
+        edit = self.field_inputs.get(field_name)
+        if edit is not None:
+            if hasattr(edit, "toPlainText"):
+                current_text = edit.toPlainText()
+            else:
+                current_text = edit.text()
+            new_text = f"{current_text} {ocr_result}" if current_text else ocr_result
+            edit.setText(new_text)
+
+            show_success(
+                self,
+                "识别成功",
+                f"已将识别结果填充到【{field_name[:10]}】字段\n识别内容：{ocr_result}",
+                2000,
+            )
+            logger.info(f"OCR识别成功; 识别内容：{ocr_result}")
+
+        QTimer.singleShot(1000, self.clear_image_selection)
+
+    def _on_ocr_recognition_failed(self, request_id, error_message):
+        request_info = self._ocr_pending_requests.pop(request_id, None)
+        if request_info is None:
+            return
+        show_error(self, "OCR识别失败", f"识别过程中出现错误：{error_message}")
+        logger.error(f"识别过程中出现错误：{error_message}")
+        self.clear_image_selection()
 
     def clear_image_selection(self):
         self.image_container.clear_selection()
@@ -1611,8 +1960,6 @@ class DirWindow(FramelessWindow):
 
     def next_page(self):
         """下一页"""
-        self.parts_files_image.append(self.current_image_path)
-
         if self.current_page < self.total_images:
             self.current_page += 1
             self.update_image_display()
@@ -1881,7 +2228,11 @@ class DirWindow(FramelessWindow):
             logger.error(f"目录录入/校对; 提交失败: {str(e)}")
             show_error(self, "报错", "提交失败")
 
-    def save_catalog(self):
+    def save_catalog(self, show_message=True, clear_fields=True):
+        # 合同档案无论通过保存还是“保存并分件”进入，都保证登记日期
+        # 在读取表单前具有当天默认值。
+        self._apply_contract_date_default()
+
         catalog_data = {}
         for field, edit in self.field_inputs.items():
             catalog_data[field] = edit.text().strip()
@@ -1889,14 +2240,27 @@ class DirWindow(FramelessWindow):
         # 验证必填字段
         required_fields = [field[0] for field in self.fields if field[2] == "是"]
         print(f"必填字段: {required_fields}")
-        empty_fields = [field for field in required_fields if not catalog_data[field]]
+        empty_fields = [
+            field for field in required_fields if not catalog_data.get(field, "")
+        ]
 
         if empty_fields:
             show_error(
                 self, "提交失败", f"以下必填字段不能为空：{', '.join(empty_fields)}"
             )
             logger.error(f"以下必填字段不能为空：{', '.join(empty_fields)}")
-            return
+            return False
+
+        identifier_value = catalog_data.get(self.identifier_field_name, "").strip()
+        if not identifier_value:
+            show_error(
+                self,
+                "保存失败",
+                f"{self.identifier_field_name}不能为空",
+            )
+            return False
+        self.doc_number = identifier_value
+        title_value = catalog_data.get(self.title_field_name, "").strip()
 
         print(f"catalog_data: {catalog_data}")
 
@@ -1908,14 +2272,14 @@ class DirWindow(FramelessWindow):
         where = {
             "archive_type": archive_type,
             "category": category,
-            "doc_number": catalog_data["档号"],
+            "doc_number": identifier_value,
         }
         is_exist = director_service.get_dir_info(where)
         print(f"is_exist: {is_exist}")
         if is_exist:
             update = {
                 "register_id": self.register_info.id,
-                "title": catalog_data["题名"],
+                "title": title_value,
                 "director_info": json.dumps(catalog_data, ensure_ascii=False),
                 "source": "校对",
                 "update_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1924,7 +2288,8 @@ class DirWindow(FramelessWindow):
             try:
                 result = director_service.update_director(is_exist[0].id, update)
                 print(f"result: {result}")
-                show_success(self, "提示", "保存成功!")
+                if show_message:
+                    show_success(self, "提示", "保存成功!")
                 operation_data = {
                     "task_id": self.task_info.id,
                     "task_name": "目录录入/校对",
@@ -1933,16 +2298,17 @@ class DirWindow(FramelessWindow):
                     "operator_remark": f"更新目录; 目录信息:{update}",
                 }
                 operation_service.save_data([operation_data])
+                return True
             except Exception as e:
                 logger.error(f"更新失败; 更新信息: {update}; 错误原因: {e}")
                 show_error(self, "报错", "保存失败")
-                return
+                return False
 
         else:
             add_data = {
                 "register_id": self.register_info.id,
-                "doc_number": catalog_data["档号"],
-                "title": catalog_data["题名"],
+                "doc_number": identifier_value,
+                "title": title_value,
                 "archive_type": archive_type,
                 "category": category,
                 "source": "自填",
@@ -1963,12 +2329,22 @@ class DirWindow(FramelessWindow):
                         "operator_remark": f"保存目录; 目录信息:{add_data}",
                     }
                     operation_service.save_data([operation_data])
-                    show_success(self, "保存成功", f"{self.doc_number} 目录信息已保存")
+                    if show_message:
+                        show_success(
+                            self,
+                            "保存成功",
+                            f"{self.doc_number} 目录信息已保存",
+                        )
                     logger.info(f"{self.doc_number}目录信息已保存")
-                    for field, edit in self.field_inputs.items():
-                        edit.setText("")
+                    if clear_fields:
+                        self._clear_catalog_fields()
+                    return True
+                show_error(self, "保存失败", "目录信息未保存，请重试")
+                return False
             except Exception as e:
                 logger.error(f"提交失败: {str(e)}")
+                show_error(self, "保存失败", f"目录信息保存失败: {str(e)}")
+                return False
 
     def back_table(self):
         self._is_navigation = True

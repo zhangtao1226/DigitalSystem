@@ -7,7 +7,6 @@
 
 import pandas as pd
 from datetime import datetime
-from openpyxl import load_workbook
 from PySide6.QtGui import (
     QFont, QColor, QBrush,
 )
@@ -25,6 +24,7 @@ from qfluentwidgets import (
 )
 
 from src.core.settings import settings
+from src.services.archive_category_service import archive_category_service
 from src.utils.LoggerDetector import logger
 from src.utils.NotificationTool import show_error, show_success, show_warning
 
@@ -239,6 +239,7 @@ class ArchiveCategoryPage(QWidget):
         super().__init__(parent)
         setTheme(Theme.AUTO)
         self._current_category = None
+        self._current_category_record = None
         self._sample_fields = {}
         self.is_add = False
         self.is_save = False
@@ -430,35 +431,38 @@ class ArchiveCategoryPage(QWidget):
 
     def _load_tree(self):
         try:
-            excel_file = pd.ExcelFile(settings.archives_template_path)
-            sheet_names = excel_file.sheet_names
-            print(sheet_names)
+            archive_category_service.ensure_tables()
+            archive_category_service.bootstrap_from_excel(
+                settings.archives_template_path
+            )
+            category_records = archive_category_service.get_categories()
         except Exception as e:
-            show_error(self, "档案类型表读取失败", f"原因: {str(e)}")
+            show_error(self, "档案类别读取失败", f"原因: {str(e)}")
             return
 
         categories = {}
-        for item in sheet_names:
-            file_type, level = item.split("-", 1)
-            if file_type not in categories:
-                categories[file_type] = []
-            if level not in categories[file_type]:
-                categories[file_type].append(level)
+        for record in category_records:
+            categories.setdefault(record.archive_type, []).append(
+                record.category_level
+            )
 
         self._sample_fields = {}
-        for sheet_name in sheet_names:
-            df = pd.read_excel(settings.archives_template_path, sheet_name=sheet_name)
-            self._sample_fields[sheet_name] = []
-            for index, series in df.iterrows():
-                self._sample_fields[sheet_name].append(
-                    {
-                        "field_name": series.iloc[1],
-                        "alias": series.iloc[2],
-                        "field_type": series.iloc[3],
-                        "length": series.iloc[4],
-                        "required": "是" if series.iloc[5] == "Y" else "否"
-                    }
-                )
+        for record in category_records:
+            fields = sorted(
+                record.fields,
+                key=lambda item: (item.sort_order, item.id),
+            )
+            self._sample_fields[record.display_name] = [
+                {
+                    "field_name": field.field_name,
+                    "alias": field.alias,
+                    "field_type": field.field_type,
+                    "length": field.field_length,
+                    "required": "是" if field.required else "否",
+                }
+                for field in fields
+                if field.enabled
+            ]
 
         self.tree_widget.clear()
         for parent_name, children in categories.items():
@@ -484,8 +488,14 @@ class ArchiveCategoryPage(QWidget):
             self.is_save = True
             self.is_download = True
             self._current_category = f"{current.parent().text(0)}-{current.text(0)}"
+            self._current_category_record = (
+                archive_category_service.get_by_display_name(
+                    self._current_category
+                )
+            )
         else:
             self._current_category = current.text(0)
+            self._current_category_record = None
             self.is_add = False
             self.is_save = False
             self.is_download = False
@@ -599,8 +609,6 @@ class ArchiveCategoryPage(QWidget):
             self._append_row(new_data)
             show_success(self, "新增成功", f"字段 '{new_data['field_name']}' 已添加")
 
-            self._load_tree()
-
     def _delete_fields(self):
         checked_rows = []
         for row in range(self.field_table.rowCount()):
@@ -623,47 +631,43 @@ class ArchiveCategoryPage(QWidget):
             self.field_table._reindex()
             show_success(self, "删除成功", f"已删除 {len(checked_rows)} 个字段")
 
-            self._load_tree()
-
     def _save_fields(self):
         if self.is_save:
-            w = MessageBox("确认保存", f"确定要保存当前字段信息表吗？\n此操作不可撤销, 保存后会更新档案模版表", self)
+            w = MessageBox(
+                "确认保存",
+                "确定要保存当前字段定义吗？\n"
+                "保存后目录导入与管理页面将读取新的数据库配置。",
+                self,
+            )
             w.yesButton.setText("确定")
             w.cancelButton.setText("取消")
             if w.exec():
                 current_fields_info = []
                 for row in range(self.field_table.rowCount()):
-                    row_data_list = []
-                    for col in range(1, 7):
-                        row_data_list.append(self.field_table.item(row, col).text())
-
-                    current_fields_info.append(row_data_list)
-
-                df = pd.read_excel(settings.archives_template_path, sheet_name=f"{self._current_category}")
-                current_fields_info.insert(0, df.columns.values.tolist())
-
-                columns = current_fields_info[0]
-                rows = current_fields_info[1:]
-                new_df = pd.DataFrame(rows, columns=columns)
+                    current_fields_info.append(
+                        {
+                            "field_name": self.field_table.item(row, 2).text(),
+                            "alias": self.field_table.item(row, 3).text(),
+                            "field_type": self.field_table.item(row, 4).text(),
+                            "length": self.field_table.item(row, 5).text(),
+                            "required": self.field_table.item(row, 6).text(),
+                        }
+                    )
 
                 try:
-                    book = load_workbook(settings.archives_template_path)
-
-                    with pd.ExcelWriter(
-                            settings.archives_template_path,
-                            engine="openpyxl",
-                            mode="a",
-                            if_sheet_exists="replace"
-                    ) as writer:
-                        new_df.to_excel(writer, sheet_name=self._current_category, index=False)
-
+                    if self._current_category_record is None:
+                        raise ValueError("档案类别不存在，请刷新后重试")
+                    archive_category_service.replace_fields(
+                        self._current_category_record.id,
+                        current_fields_info,
+                        expected_version=self._current_category_record.version,
+                    )
                     logger.info(f"{self._current_category}, 保存字段信息表")
                     self._load_tree()
-
-                except FileNotFoundError:
-                    print(f"错误：未找到文件 {settings.archives_template_path}，请检查文件路径是否正确！")
+                    show_success(self, "保存成功", "字段定义已保存到数据库")
                 except Exception as e:
-                    print(f"写入失败：{str(e)}")
+                    logger.error(f"保存档案字段失败: {e}")
+                    show_error(self, "保存失败", str(e))
         else:
             show_warning(self, "警告", "未选择档案类别")
             return

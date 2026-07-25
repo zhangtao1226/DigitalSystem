@@ -42,6 +42,24 @@ from src.view.common.CommonProgressBar import CommonProgressDialog
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
+def _get_register_scan_context(register_id):
+    """获取同一登记记录下的扫描任务和扫描目录记录。"""
+    scan_tasks = task_service.get_data({
+        "register_id": register_id,
+        "task_node": 2,
+    })
+    scan_task_ids = [task.id for task in scan_tasks]
+    scan_info = scan_service.get_scan_info_taskId(scan_task_ids)
+
+    # 兼容历史数据：部分扫描记录可能没有关联到当前查询出的扫描任务，
+    # 但仍然正确关联了登记记录。
+    if not scan_info:
+        scan_info = scan_service.get_scan_info({"register_id": register_id})
+
+    scan_info = sorted(scan_info, key=lambda item: item.id)
+    return scan_tasks, scan_info
+
+
 class ProductOcrWorker(QObject):
     progress_changed = Signal(int, int, str)
     finished = Signal(int, int)
@@ -605,7 +623,7 @@ class InfoDisplayWidget(CardWidget):
 
 class ImageDirectoryTree(CardWidget):
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, scan_info=None):
         super().__init__(parent)
         self.current_selected_folder = None
         self.selected_folder_item    = None
@@ -613,27 +631,11 @@ class ImageDirectoryTree(CardWidget):
         self.setStyleSheet("CardWidget { background-color:#ffffff; border:1px solid #e0e0e0; }")
         self.main_window = parent
 
-        self.current_data = global_cache.get("current_data", None)
-        self.current_user = global_cache.get("current_user", None)
-
-        self.task_info = task_service.get_by_id(self.current_data[0])
-        print(f"task_info: {self.task_info}")
-
-        scan_where = {
-            "register_id": self.task_info.register_id,
-            "task_id": 2,
-        }
-        self.scan_task_info = task_service.get_data(scan_where)
-        self.register_info = register_service.get_by_id(self.task_info.register_id)
-
-        task_ids = [scan.id for scan in self.scan_task_info]
-        scan_info = scan_service.get_scan_info_taskId(task_ids)
-        print(f"scan_info: {scan_info}")
-
-        self.dir_path = scan_info[-1].dir_path
+        self.scan_info = list(scan_info or [])
+        self.dir_path = self.scan_info[-1].dir_path if self.scan_info else ""
 
         self.dir_name_list = []
-        for scan in scan_info:
+        for scan in self.scan_info:
             dir_name = scan.dir_name.split("/")
             print(222, dir_name)
             if dir_name[0] not in self.dir_name_list:
@@ -699,10 +701,18 @@ class ImageDirectoryTree(CardWidget):
 
     def _load_tree(self, root_path=None):
         root_path = root_path or self.dir_path
+        self.tree_widget.clear()
+        if not root_path:
+            empty_item = QTreeWidgetItem(self.tree_widget)
+            empty_item.setText(0, "暂无可用扫描目录")
+            empty_item.setFlags(empty_item.flags() & ~Qt.ItemIsSelectable)
+            self.selected_folder_item = None
+            self.current_selected_folder = None
+            return
+
         if not os.path.exists(root_path):
             root_path = f"{os.getcwd()}/upload_images"
 
-        self.tree_widget.clear()
         root_item = QTreeWidgetItem(self.tree_widget)
         root_item.setText(0, os.path.basename(root_path))
         root_item.setData(0, Qt.UserRole, {"type": "folder", "path": root_path})
@@ -972,19 +982,11 @@ class ProductOutputWindow(FramelessWindow):
         self.task_info = task_service.get_by_id(self.current_data[0])
         print(f"task_info: {self.task_info}")
 
-        scan_task_where = {
-            "register_id": self.task_info.register_id,
-            "task_id": 2,
-        }
-        self.scan_task_info = task_service.get_data(scan_task_where)
+        self.scan_task_info, self.scan_info = _get_register_scan_context(
+            self.task_info.register_id
+        )
         self.register_info = register_service.get_by_id(self.task_info.register_id)
-
-        where = {
-            "register_id": self.task_info.register_id,
-            "task_id": self.scan_task_info[0].id
-        }
-        scan_info = scan_service.get_scan_info(where)
-        print(f"scan_info: {scan_info}")
+        print(f"scan_info: {self.scan_info}")
 
         self.current_pdf_path      = None
         self.current_selected_path = None
@@ -1013,6 +1015,8 @@ class ProductOutputWindow(FramelessWindow):
         self.ocr_detector = None
 
         self._init_ui()
+        if not self.scan_info:
+            QTimer.singleShot(0, self._show_missing_scan_warning)
 
     def center(self):
         geo = QApplication.primaryScreen().availableGeometry()
@@ -1038,7 +1042,7 @@ class ProductOutputWindow(FramelessWindow):
         """)
         splitter.setChildrenCollapsible(False)
 
-        self.directory_tree = ImageDirectoryTree(self)
+        self.directory_tree = ImageDirectoryTree(self, self.scan_info)
         splitter.addWidget(self.directory_tree)
 
         self.gallery_widget = ImageGalleryWidget()
@@ -1064,6 +1068,13 @@ class ProductOutputWindow(FramelessWindow):
             lambda: self._annotation_timer.start(150))
 
         self._check_task_status()
+
+    def _show_missing_scan_warning(self):
+        show_warning(
+            self,
+            "提示",
+            "未找到该批次的扫描记录，请先完成扫描任务后再查看详情。",
+        )
 
     def _check_task_status(self):
         self.can_do_task = None

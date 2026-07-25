@@ -33,33 +33,13 @@ from src.core.cache_manager import global_cache
 from src.utils.LoggerDetector import logger
 from src.utils.NotificationTool import show_error, show_success, show_warning
 
+from src.services.archive_category_service import archive_category_service
 from src.services.director_service import director_service
 
 
-# ─────────────────────────── 档案类别字段定义 ────────────────────────────
-# 每个 sheet 的别名列表（不含序号），用于表头显示
-CATEGORY_HEADERS = {
-    "文书档案-案卷级": ["档号", "保管期限", "题名", "责任者", "起始时间", "终止时间", "页数"],
-    "文书档案-文件级": ["档号", "题名", "保管期限", "文号", "责任者", "日期", "页数", "密级", "主题词", "控制符", "备注"],
-    "照片档案-案卷级": ["档号", "保管期限", "题名", "起始时间", "终止时间", "页数", "密级", "摄影者", "备注"],
-    "照片档案-文件级": ["档号", "保管期限", "题名", "摄影者", "参见号", "密级", "备注", "页数", "摄影时间"],
-    "会计档案-案卷级": ["档号", "保管期限", "类别", "题名", "起止时间", "卷内张数", "备注", "立卷部门", "归档时间", "立卷人"],
-    "会计档案-文件级": ["档号", "责任者", "文号", "题名", "日期", "页数", "保管期限", "备注", "密级"],
-    "科技档案-案卷级": ["档号", "保管期限", "题名", "起止时间", "页数", "密级", "备注", "立卷单位", "立卷人", "立卷日期", "检查人", "检查日期"],
-    "科技档案-文件级": ["档号", "保管期限", "题名", "责任者", "日期", "页数", "密级", "主题词", "备注"],
-}
-
-# 字段名（英文列名），与别名一一对应，供导入/导出 Excel 时使用
-CATEGORY_FIELDS = {
-    "文书档案-案卷级": ["dh", "bgqx", "tm", "zrz", "qssj", "zzsj", "ys"],
-    "文书档案-文件级": ["dh", "tm", "bgqx", "wh", "zrz", "cwrq", "ys", "mj", "ztc", "kzf", "bz"],
-    "照片档案-案卷级": ["dh", "bgqx", "tm", "qssj", "zzsj", "ys", "mj", "syz", "bz"],
-    "照片档案-文件级": ["dh", "bgqx", "tm", "syz", "cjh", "mj", "bz", "ys", "sysj"],
-    "会计档案-案卷级": ["dh", "bgqx", "lb", "tm", "qzsj", "jnzs", "bz", "ljbm", "gdsj", "ljr"],
-    "会计档案-文件级": ["dh", "zrz", "wh", "tm", "cwrq", "ys", "bgqx", "bz", "mj"],
-    "科技档案-案卷级": ["dh", "bgqx", "tm", "qzsj", "ys", "mj", "bz", "ljdw", "ljr", "ljrq", "jcr", "jcrq"],
-    "科技档案-文件级": ["dh", "bgqx", "tm", "zrz", "cwrq", "ys", "mj", "ztc", "bz"],
-}
+# 由 ArchiveCategoryService 从数据库动态填充。
+CATEGORY_HEADERS = {}
+CATEGORY_FIELDS = {}
 
 PAGE_SIZE = 20  # 每页行数
 
@@ -191,12 +171,15 @@ class ImportDirectoryPage(QWidget):
         setTheme(Theme.AUTO)
         self._current_category: str = ""
         self._current_headers: list = []   # 当前类别的别名列表
+        self._identifier_header = "档号"
+        self._title_header = "题名"
         self._all_data: list = []          # 全量数据（list of dict）
         self._filtered_data: list = []     # 筛选后数据
         self._current_page: int = 1
         self._total_pages: int = 1
         self._filter_values: dict = {}     # 列头筛选值 {header: text}
         self._import_df = None
+        self._import_identifier_column = ""
         self._add_exit_list = []
 
         self._filters:dict = {}
@@ -204,7 +187,37 @@ class ImportDirectoryPage(QWidget):
         self._import_data_question = []
 
         self.current_user = global_cache.get("current_user")
+        self._load_category_definitions()
         self._init_ui()
+
+    def _load_category_definitions(self):
+        """加载与档案类别管理页面相同的数据库类别及字段配置。"""
+        archive_category_service.ensure_tables()
+        archive_category_service.bootstrap_from_excel(
+            settings.archives_template_path
+        )
+
+        CATEGORY_HEADERS.clear()
+        CATEGORY_FIELDS.clear()
+        for category in archive_category_service.get_categories():
+            fields = sorted(
+                category.fields,
+                key=lambda item: (item.sort_order, item.id),
+            )
+            enabled_fields = [item for item in fields if item.enabled]
+            CATEGORY_HEADERS[category.display_name] = [
+                item.alias for item in enabled_fields
+            ]
+            CATEGORY_FIELDS[category.display_name] = [
+                item.field_name for item in enabled_fields
+            ]
+
+    @staticmethod
+    def _find_business_header(headers, candidates, fallback):
+        return next((name for name in candidates if name in headers), fallback)
+
+    def _current_category_parts(self):
+        return self._current_category.rsplit("-", 1)
 
     # ──────────────────── UI 构建 ────────────────────
 
@@ -394,6 +407,9 @@ class ImportDirectoryPage(QWidget):
         self.table.setShowGrid(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.setStyleSheet("""
             QTableWidget {
                 border: 1px solid #bbdefb; border-radius: 8px;
@@ -442,6 +458,16 @@ class ImportDirectoryPage(QWidget):
             return
         self._current_category = category
         self._current_headers = CATEGORY_HEADERS.get(category, [])
+        self._identifier_header = self._find_business_header(
+            self._current_headers,
+            ("档号", "合同编号"),
+            "档号",
+        )
+        self._title_header = self._find_business_header(
+            self._current_headers,
+            ("题名", "合同名称"),
+            "题名",
+        )
         self._filter_values = {}
         self._all_data = []
         self._filtered_data = []
@@ -467,13 +493,23 @@ class ImportDirectoryPage(QWidget):
         self.table.setHorizontalHeaderLabels(labels)
 
         hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setMinimumSectionSize(40)
+        hdr.setTextElideMode(Qt.ElideNone)
         hdr.setSectionResizeMode(0, QHeaderView.Fixed)
         self.table.setColumnWidth(0, 40)
         hdr.setSectionResizeMode(1, QHeaderView.Fixed)
         self.table.setColumnWidth(1, 55)
 
-        for c in range(2, 2 + len(headers)):
-            hdr.setSectionResizeMode(c, QHeaderView.Stretch)
+        font_metrics = self.table.fontMetrics()
+        for index, header_text in enumerate(headers, start=2):
+            hdr.setSectionResizeMode(index, QHeaderView.Interactive)
+            header_width = font_metrics.horizontalAdvance(header_text) + 48
+            self.table.setColumnWidth(index, max(110, min(header_width, 320)))
+            header_item = self.table.horizontalHeaderItem(index)
+            if header_item is not None:
+                header_item.setToolTip(header_text)
+
         op_col = 2 + len(headers)
         hdr.setSectionResizeMode(op_col, QHeaderView.Fixed)
         self.table.setColumnWidth(op_col, 155)
@@ -481,36 +517,29 @@ class ImportDirectoryPage(QWidget):
         # 设置页数宽度
         if "页数" in headers:
             page_col = 2 + headers.index("页数")
-            hdr.setSectionResizeMode(page_col, QHeaderView.Fixed)
-            self.table.setColumnWidth(page_col, 55)
+            self.table.setColumnWidth(page_col, 80)
 
-        if "档号" in headers:
-            ar_col = 2 + headers.index("档号")
-            hdr.setSectionResizeMode(ar_col, QHeaderView.Fixed)
+        if self._identifier_header in headers:
+            ar_col = 2 + headers.index(self._identifier_header)
             self.table.setColumnWidth(ar_col, 215)
 
         if "卷内张数" in headers:
             page_col = 2 + headers.index("卷内张数")
-            hdr.setSectionResizeMode(page_col, QHeaderView.Fixed)
-            self.table.setColumnWidth(page_col, 55)
+            self.table.setColumnWidth(page_col, 110)
 
         if "保管期限" in headers:
             date_col = 2 + headers.index("保管期限")
-            hdr.setSectionResizeMode(date_col, QHeaderView.Fixed)
-            self.table.setColumnWidth(date_col, 65)
+            self.table.setColumnWidth(date_col, 110)
 
-        if "起始时间" in headers or "终止时间" in headers:
+        if "起始时间" in headers:
             date_col = 2 + headers.index("起始时间")
-            hdr.setSectionResizeMode(date_col, QHeaderView.Fixed)
             self.table.setColumnWidth(date_col, 125)
-        if  "终止时间" in headers:
+        if "终止时间" in headers:
             date_col = 2 + headers.index("终止时间")
-            hdr.setSectionResizeMode(date_col, QHeaderView.Fixed)
             self.table.setColumnWidth(date_col, 125)
 
-        if "题名" in headers:
-            title_col = 2 + headers.index("题名")
-            hdr.setSectionResizeMode(title_col, QHeaderView.Fixed)
+        if self._title_header in headers:
+            title_col = 2 + headers.index(self._title_header)
             self.table.setColumnWidth(title_col, 325)
 
 
@@ -535,7 +564,7 @@ class ImportDirectoryPage(QWidget):
         self.filter_layout.addWidget(spacer_idx)
 
         # 筛选框
-        for header in ["档号", "题名"]:
+        for header in [self._identifier_header, self._title_header]:
             edit = QLineEdit()
             edit.setPlaceholderText(f"筛选{header}")
             edit.setStyleSheet("""
@@ -568,10 +597,9 @@ class ImportDirectoryPage(QWidget):
     # ──────────────────── 表格刷新（分页） ────────────────────
 
     def _refresh_table(self):
-        archive_type = self._current_category.split('-')[0]
-        category = self._current_category.split('-')[1]
-        title = self._filters.get("题名", None)
-        doc_number = self._filters.get("档号", None)
+        archive_type, category = self._current_category_parts()
+        title = self._filters.get(self._title_header, None)
+        doc_number = self._filters.get(self._identifier_header, None)
         total = director_service.get_total(archive_type=archive_type, category=category,
                                            title=title, doc_number=doc_number)
 
@@ -581,7 +609,7 @@ class ImportDirectoryPage(QWidget):
         start = (self._current_page - 1) * PAGE_SIZE
         end = min(start + PAGE_SIZE, total)
 
-        page_data = director_service.get_list(skip=start, limit= end, archive_type=archive_type, category=category,
+        page_data = director_service.get_list(skip=start, limit=PAGE_SIZE, archive_type=archive_type, category=category,
                                               title=title, doc_number=doc_number)
 
         self._all_data = page_data
@@ -659,25 +687,37 @@ class ImportDirectoryPage(QWidget):
             self._import_df = df
             headers = self._current_headers
             fields = CATEGORY_HEADERS.get(self._current_category, [])
+            field_names = CATEGORY_FIELDS.get(self._current_category, [])
 
             # 校验字段（档案门类、类别）
-            verify_result = self.verify_field(fields, df.columns.to_list())
+            verify_result = self.verify_field(
+                fields,
+                df.columns.to_list(),
+                field_names,
+            )
 
             if not verify_result['status']:
                 show_error(self, "导入失败", f"原因: {verify_result['message']}")
                 return
 
+            identifier_index = headers.index(self._identifier_header)
+            identifier_field_name = field_names[identifier_index]
+            self._import_identifier_column = (
+                self._identifier_header
+                if self._identifier_header in df.columns
+                else identifier_field_name
+            )
+
             # 尝试按别名列或字段名列匹配
             imported = []
             for _, series in df.iterrows():
                 row_dict = {}
-                archival_number = ""
                 for i, h in enumerate(headers):
                     # 先尝试别名，再尝试字段名
                     if h in df.columns:
                         row_dict[h] = str(series.get(h, ""))
-                    elif i < len(fields) and fields[i] in df.columns:
-                        row_dict[h] = str(series.get(fields[i], ""))
+                    elif i < len(field_names) and field_names[i] in df.columns:
+                        row_dict[h] = str(series.get(field_names[i], ""))
                     else:
                         # 按列位置匹配
                         if i < len(df.columns):
@@ -685,15 +725,12 @@ class ImportDirectoryPage(QWidget):
                         else:
                             row_dict[h] = ""
 
-                    if h == "档号":
-                        archival_number  = series.iloc[i + 1]
-
                 data_dict = {
                     "register_id": 0,
-                    "archive_type": self._current_category.split('-')[0],
-                    "category": self._current_category.split('-')[1],
-                    "doc_number": archival_number,
-                    "title": row_dict["题名"],
+                    "archive_type": self._current_category_parts()[0],
+                    "category": self._current_category_parts()[1],
+                    "doc_number": row_dict.get(self._identifier_header, ""),
+                    "title": row_dict.get(self._title_header, ""),
                     "director_info": json.dumps(row_dict, ensure_ascii=False),
                     "source": "导入",
                     "create_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -711,13 +748,20 @@ class ImportDirectoryPage(QWidget):
         except Exception as e:
             show_error(self, "导入失败", str(e))
 
-    def verify_field(self, default_field, expected_field):
-        if len(default_field) != len(expected_field) - 1:
+    def verify_field(self, aliases, imported_columns, field_names=None):
+        expected_columns = list(imported_columns)
+        if "序号" in expected_columns:
+            expected_columns.remove("序号")
+
+        if len(aliases) != len(expected_columns):
             return {"status": False, "message": "字段数不一致!"}
 
-        if "序号" in expected_field:
-            expected_field.remove("序号")
-        if sorted(default_field) != sorted(expected_field):
+        aliases_match = sorted(aliases) == sorted(expected_columns)
+        field_names_match = (
+            bool(field_names)
+            and sorted(field_names) == sorted(expected_columns)
+        )
+        if not aliases_match and not field_names_match:
             return {'status': False, "message": "字段名不一致！"}
 
         return {"status": True, "message": ""}
@@ -729,10 +773,9 @@ class ImportDirectoryPage(QWidget):
             show_warning(self, "警告", "请先选择左侧档案类别！")
             return
 
-        archive_type = self._current_category.split('-')[0]
-        category = self._current_category.split('-')[1]
-        title = self._filters.get("题名", None)
-        doc_number = self._filters.get("档号", None)
+        archive_type, category = self._current_category_parts()
+        title = self._filters.get(self._title_header, None)
+        doc_number = self._filters.get(self._identifier_header, None)
         data_total = director_service.get_total(archive_type=archive_type, category=category, doc_number=doc_number, title=title)
 
         if data_total == 0:
@@ -771,10 +814,10 @@ class ImportDirectoryPage(QWidget):
             data = dlg.get_data()
             data_dict = {
                 "register_id": 0,
-                "archive_type": self._current_category.split('-')[0],
-                "category": self._current_category.split('-')[1],
-                "doc_number": data['档号'],
-                "title": data['题名'],
+                "archive_type": self._current_category_parts()[0],
+                "category": self._current_category_parts()[1],
+                "doc_number": data.get(self._identifier_header, ""),
+                "title": data.get(self._title_header, ""),
                 "director_info": json.dumps(data, ensure_ascii=False),
                 "source": "添加",
                 "create_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -861,7 +904,13 @@ class ImportDirectoryPage(QWidget):
             show_warning(self, "提示", "暂无问题可下载")
             return
 
-        d_df = self._import_df[self._import_df["档号"].isin(self._add_exit_list)]
+        identifier_column = self._import_identifier_column
+        if not identifier_column or identifier_column not in self._import_df.columns:
+            show_error(self, "导出失败", "未找到导入文件中的档号或合同编号列")
+            return
+        d_df = self._import_df[
+            self._import_df[identifier_column].isin(self._add_exit_list)
+        ]
 
         path, _ = QFileDialog.getSaveFileName(
             self, "导出目录",

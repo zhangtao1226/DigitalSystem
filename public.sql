@@ -1227,3 +1227,41 @@ ALTER TABLE "public"."task_progress" ADD CONSTRAINT "task_progress_task_id_fkey"
 -- ----------------------------
 ALTER TABLE "public"."user_role_association" ADD CONSTRAINT "user_role_association_role_id_fkey" FOREIGN KEY ("role_id") REFERENCES "public"."roles" ("id") ON DELETE NO ACTION ON UPDATE NO ACTION;
 ALTER TABLE "public"."user_role_association" ADD CONSTRAINT "user_role_association_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users" ("id") ON DELETE NO ACTION ON UPDATE NO ACTION;
+
+-- ----------------------------
+-- 档案类别与目录字段定义
+-- ----------------------------
+CREATE TABLE IF NOT EXISTS archive_category (
+    id SERIAL PRIMARY KEY,
+    archive_type VARCHAR(100) NOT NULL,
+    category_level VARCHAR(50) NOT NULL,
+    category_code VARCHAR(100) NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_archive_category_type_level UNIQUE (archive_type, category_level),
+    CONSTRAINT uq_archive_category_code UNIQUE (category_code)
+);
+
+CREATE INDEX IF NOT EXISTS ix_archive_category_enabled
+    ON archive_category (enabled);
+
+CREATE TABLE IF NOT EXISTS archive_category_field (
+    id SERIAL PRIMARY KEY,
+    category_id INTEGER NOT NULL REFERENCES archive_category(id) ON DELETE CASCADE,
+    field_name VARCHAR(100) NOT NULL,
+    alias VARCHAR(100) NOT NULL,
+    field_type VARCHAR(30) NOT NULL DEFAULT '字符型',
+    field_length INTEGER NOT NULL DEFAULT 50,
+    required BOOLEAN NOT NULL DEFAULT FALSE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_archive_category_field_name UNIQUE (category_id, field_name),
+    CONSTRAINT uq_archive_category_field_alias UNIQUE (category_id, alias)
+);
+
+CREATE INDEX IF NOT EXISTS ix_archive_category_field_order
+    ON archive_category_field (category_id, sort_order);

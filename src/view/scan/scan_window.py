@@ -1074,6 +1074,9 @@ class ScanWindow(FramelessWindow):
         self.scan_mode = "单页扫描"
         self._scan_target_ready = False
         self.is_scanning = False
+        self._blank_page_detector = BlankPageDetector()
+        self._scan_blank_deleted_count = 0
+        self._scan_next_file_index = None
 
         self.scanner_device = ""  # 扫描仪
         self.save_dir_path = ""  # 保存路径
@@ -2188,11 +2191,12 @@ class ScanWindow(FramelessWindow):
             os.remove(f"{self.selected_image_info['path']}")
         elif self.scan_mode == "插入扫描" and self.selected_image_info:
             name_before = self.selected_image_info["name"]
-            name_after = os.path.basename(
-                self.img_files[
-                    self.img_files.index(f"{self.selected_image_info['path']}") + 1
-                ]
-            ).split(".")[0]
+            selected_index = self.img_files.index(self.selected_image_info["path"])
+            name_after = ""
+            if selected_index + 1 < len(self.img_files):
+                name_after = os.path.splitext(
+                    os.path.basename(self.img_files[selected_index + 1])
+                )[0]
             file_name = self.get_inserted_name(name_before, name_after)
         else:
             file_name = f"{self.save_dir_name}"
@@ -2259,6 +2263,12 @@ class ScanWindow(FramelessWindow):
         # 3. 发起采集请求（在主线程调用，驱动可能弹框也没问题）
         try:
             os.makedirs(p["save_path"], exist_ok=True)
+            if p["scan_model"] in ["替换扫描", "插入扫描"]:
+                self._scan_next_file_index = None
+            else:
+                self._scan_next_file_index = self._next_scan_file_index(
+                    p["save_path"]
+                )
             self._clear_scan_stop_request()
             self.scanner_manager._source.request_acquire(show_ui=False, modal_ui=False)
         except Exception as e:
@@ -2271,6 +2281,7 @@ class ScanWindow(FramelessWindow):
         # 高速 ADF 扫描仪从 request_acquire 到图像就绪通常需要 3~5 秒
         # 用 QTimer.singleShot 在主线程延迟，不阻塞 UI
         self._scan_page_count = 0
+        self._scan_blank_deleted_count = 0
         self._scan_last_transfer_error = None
         self._scan_last_wait_log_time = 0.0
         self._scan_first_frame_deadline = time.time() + 15.0
@@ -2378,7 +2389,7 @@ class ScanWindow(FramelessWindow):
             if scan_model in ["替换扫描", "插入扫描"]:
                 save_path = f"{p['save_path']}/{p['file_name']}.{p['save_format']}"
             else:
-                save_path = self.scanner_manager._resolve_save_path(
+                save_path = self._next_session_scan_save_path(
                     p["file_name"], p["save_format"], p["save_path"]
                 )
             logger.info(f"成功取得第 {self._scan_page_count} 帧，准备保存: {save_path}")
@@ -2388,7 +2399,6 @@ class ScanWindow(FramelessWindow):
             save_error = None
             try:
                 self.scanner_manager._save_image(handle, save_path)
-                p["scan_result"].append(os.path.basename(save_path))
                 logger.info(f"图片保存完成: {save_path}")
             except Exception as save_err:
                 save_error = save_err
@@ -2410,7 +2420,9 @@ class ScanWindow(FramelessWindow):
                 )
                 return
 
-            self._show_scanned_page_immediately(save_path)
+            if not self._delete_scanned_page_if_blank(save_path):
+                p["scan_result"].append(os.path.basename(save_path))
+                self._show_scanned_page_immediately(save_path)
 
             if self._scan_stop_requested:
                 self._scan_stop_drain_deadline = (
@@ -2479,18 +2491,22 @@ class ScanWindow(FramelessWindow):
         raw_scan_files_count = self._scan_page_count
         save_path = self._scan_params.get("save_path", "")
         scan_files_list = self._scan_params.get("scan_result", [])
-        blank_deleted_count = 0
-
-        cleanup_result = self._cleanup_blank_pages_after_scan(
-            save_path, scan_files_list
+        blank_deleted_count = self._scan_blank_deleted_count
+        should_renumber = (
+            self._scan_params.get("scan_model") not in ["替换扫描", "插入扫描"]
+            and self._scan_params.get("scan_format") == 1
+            and blank_deleted_count > 0
         )
-        scan_files_list = cleanup_result["files_list"]
-        blank_deleted_count = cleanup_result["deleted_count"]
+
+        finalize_result = self._renumber_scan_files_after_scan(
+            save_path, scan_files_list, should_renumber=should_renumber
+        )
+        scan_files_list = finalize_result["files_list"]
         self._scan_params["scan_result"] = scan_files_list
 
-        if cleanup_result.get("processed_entire_directory"):
+        if finalize_result.get("processed_entire_directory"):
             dir_name = os.path.basename(save_path)
-            self.current_scan_info[dir_name] = cleanup_result.get(
+            self.current_scan_info[dir_name] = finalize_result.get(
                 "all_files_list", scan_files_list
             )
 
@@ -2575,16 +2591,65 @@ class ScanWindow(FramelessWindow):
                     lambda p=replaced_path: self._check_and_close_mark_after_rescan(p),
                 )
 
-    def _cleanup_blank_pages_after_scan(self, save_path, scan_files_list):
+    def _delete_scanned_page_if_blank(self, image_path):
+        """
+        双面普通扫描每接收并保存一页后立即检测空白页。
+
+        双面扫描的每个返回页都启用灰底、轻微透印检测，不依赖驱动
+        返回正反面的先后顺序；检测异常时保留原图，避免误删或中断扫描。
+        """
+        scan_model = self._scan_params.get("scan_model")
+        is_duplex_page = self._scan_params.get("scan_format") == 1
+        if not is_duplex_page or scan_model in ["替换扫描", "插入扫描"]:
+            return False
+
+        try:
+            is_blank_page = self._blank_page_detector.is_blank(
+                image_path, relaxed=True
+            )
+        except Exception as exc:
+            logger.warning(
+                f"第 {self._scan_page_count} 页空白检测失败，已保留扫描件: "
+                f"{image_path}; 原因: {exc}"
+            )
+            return False
+
+        if not is_blank_page:
+            return False
+
+        try:
+            os.remove(image_path)
+        except OSError as exc:
+            logger.warning(f"空白页删除失败，已保留扫描件: {image_path}; 原因: {exc}")
+            return False
+
+        # 当前空白页已经释放了文件名，下一张扫描件继续使用这个编号，
+        # 保证扫描过程中保留下来的图片名称始终连续。
+        deleted_index = self._extract_scan_file_index(image_path)
+        if self._scan_next_file_index is not None and deleted_index > 0:
+            self._scan_next_file_index = min(
+                self._scan_next_file_index, deleted_index
+            )
+
+        self._scan_blank_deleted_count += 1
+        logger.info(
+            f"已即时删除第 {self._scan_page_count} 页空白扫描件: {image_path}; "
+            f"下一张有效扫描件继续使用编号 {deleted_index:04d}"
+        )
+        return True
+
+    def _renumber_scan_files_after_scan(
+        self, save_path, scan_files_list, should_renumber=False
+    ):
+        """仅在双面扫描删除过空白页后连续重命名。"""
         result = {
             "files_list": scan_files_list,
-            "deleted_count": 0,
             "all_files_list": scan_files_list,
             "processed_entire_directory": False,
         }
 
         if not save_path or not os.path.isdir(save_path):
-            logger.warning(f"扫描空白页检测跳过，目录不存在: {save_path}")
+            logger.warning(f"扫描文件重排跳过，目录不存在: {save_path}")
             return result
 
         target_files = [
@@ -2592,80 +2657,86 @@ class ScanWindow(FramelessWindow):
             for file_name in scan_files_list
             if os.path.isfile(os.path.join(save_path, os.path.basename(file_name)))
         ]
-        if not target_files:
-            logger.info("扫描空白页检测跳过，本次没有可检测图片")
-            return result
 
         scan_record_exists = self._get_scan_record_by_folder(save_path) is not None
+        processed_entire_directory = not scan_record_exists
+        if not should_renumber:
+            all_files_list = self._blank_page_detector.list_image_files(save_path)
+            logger.info("本次扫描未删除双面空白页，保留现有文件名和顺序")
+            return {
+                "files_list": target_files,
+                "all_files_list": all_files_list,
+                "processed_entire_directory": processed_entire_directory,
+            }
+
         if scan_record_exists:
             start_index = self._next_scan_file_index(
                 save_path, exclude_files=target_files
             )
             processed_entire_directory = False
-            logger.info("当前目录已有扫描记录，仅检测并重排本次扫描文件")
+            logger.info("当前目录已有扫描记录，仅连续重排本次保留的扫描件")
         else:
             start_index = 1
             processed_entire_directory = True
-            logger.info("当前目录未入库，检测空白页并重排整个扫描目录")
+            logger.info("当前目录未入库，连续重排整个扫描目录")
 
         try:
-            detector = BlankPageDetector()
-            relaxed_blank_files = []
-            if self._scan_params.get("scan_format") == 1:
-                # TWAIN 双面传输通常按正面、背面成对返回；单面原稿的
-                # 空白背面可能带轻微透印，因此对每对的背面增强判定。
-                relaxed_blank_files = target_files[1::2]
-            cleanup = detector.process_directory(
-                save_path,
-                target_files=target_files,
-                relaxed_files=relaxed_blank_files,
-                renumber=False,
-            )
-
+            detector = self._blank_page_detector
             filename_prefix = self.save_dir_name or os.path.basename(save_path)
             if scan_record_exists:
                 rename_map = detector.renumber_files(
                     save_path,
-                    files=cleanup.get("kept", []),
+                    files=target_files,
                     filename_prefix=filename_prefix,
                     start_index=start_index,
                 )
             else:
-                # 只对本批文件做图像分析；整个目录最终只做文件名重排，
-                # 避免目录有数百张图片时重复进行耗时的空白识别。
                 rename_map = detector.renumber_directory(
                     save_path,
                     filename_prefix=filename_prefix,
                     start_index=1,
                 )
         except Exception as exc:
-            logger.error(f"扫描空白页检测失败: {exc}")
-            show_warning(self, "空白页检测失败", f"扫描件已保留，原因: {exc}")
+            logger.error(f"扫描文件连续重命名失败: {exc}")
+            show_warning(self, "文件重命名失败", f"扫描件已保留，原因: {exc}")
             return result
 
-        deleted_files = set(cleanup.get("deleted", []))
-        cleaned_files_list = [
+        renamed_files_list = [
             rename_map.get(os.path.basename(file_name), os.path.basename(file_name))
             for file_name in scan_files_list
-            if os.path.basename(file_name) not in deleted_files
         ]
 
-        deleted_count = len(deleted_files)
         all_files_list = detector.list_image_files(save_path)
 
         logger.info(
-            f"扫描空白页检测及文件重排完成，删除 {deleted_count} 页，"
-            f"本次保留 {len(cleaned_files_list)} 页"
+            f"扫描件连续重命名完成，本次保留 {len(renamed_files_list)} 页，"
+            f"目录现有 {len(all_files_list)} 页"
         )
-        if cleanup.get("errors"):
-            logger.warning(f"部分扫描件空白页检测失败: {cleanup['errors']}")
 
         return {
-            "files_list": cleaned_files_list,
-            "deleted_count": deleted_count,
+            "files_list": renamed_files_list,
             "all_files_list": all_files_list,
             "processed_entire_directory": processed_entire_directory,
         }
+
+    def _next_session_scan_save_path(self, name, ext, directory):
+        """
+        为当前扫描会话生成连续文件名。
+
+        正常情况下编号递增；某页被判定为空白并删除后，空白检测逻辑会
+        释放该页编号，让下一张有效扫描件直接继续使用。
+        """
+        if self._scan_next_file_index is None:
+            self._scan_next_file_index = self._next_scan_file_index(directory)
+
+        while True:
+            current_index = self._scan_next_file_index
+            self._scan_next_file_index += 1
+            candidate = os.path.join(
+                directory, f"{name}-{current_index:04d}.{ext}"
+            )
+            if not os.path.exists(candidate):
+                return candidate
 
     def _next_scan_file_index(self, dir_path, exclude_files=None):
         excluded = {os.path.basename(name) for name in (exclude_files or [])}

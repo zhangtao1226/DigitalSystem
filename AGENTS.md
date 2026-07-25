@@ -110,7 +110,7 @@ src/core/settings.py
 日志配置也在 `settings.log_info`，默认写入：
 
 ```text
-src/logs/app.log
+logs/app.log
 ```
 
 ## 数据库
@@ -409,7 +409,7 @@ python3 build_windows_exe.py
 - `src/api/routers/ocr.py` 当前没有在 FastAPI 应用中启用；需要 OCR API 时先检查 `src/api/app.py` 的路由挂载。
 - 扫描相关代码依赖 Windows/TWAIN 设备，Mac 环境通常只能做语法和静态检查。
 - OCR 模型和图像资源体积较大，打包时必须确认 `src/resources` 被包含。
-- `src/logs/`、`src/resources/temp/`、`src/resources/output/` 是运行产物目录。
+- `logs/`、`src/resources/temp/`、`src/resources/output/` 是运行产物目录。
 - 现有服务层普遍直接管理数据库会话，改动时注意 commit/rollback/close。
 - UI 窗口普遍使用全屏切换和 `QTimer.singleShot(100, self.close)` 关闭旧窗口，改导航时要确认窗口生命周期。
 

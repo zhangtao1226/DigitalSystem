@@ -6,10 +6,12 @@
 
 import os
 import re
+import time
 import uuid
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from src.utils.LoggerDetector import logger
 
@@ -33,6 +35,8 @@ class BlankPageDetector:
         duplex_dark_rate_threshold=0.015,
         duplex_ink_rate_threshold=0.10,
         duplex_edge_rate_threshold=0.035,
+        read_retry_count=3,
+        read_retry_delay=0.05,
     ):
         self.std_threshold = std_threshold
         self.mean_threshold_low = mean_threshold_low
@@ -49,11 +53,12 @@ class BlankPageDetector:
         self.duplex_dark_rate_threshold = duplex_dark_rate_threshold
         self.duplex_ink_rate_threshold = duplex_ink_rate_threshold
         self.duplex_edge_rate_threshold = duplex_edge_rate_threshold
+        self.read_retry_count = max(0, int(read_retry_count))
+        self.read_retry_delay = max(0.0, float(read_retry_delay))
 
     def is_blank(self, image_path, relaxed=False):
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        img = self._read_grayscale_image(image_path)
         if img is None:
-            logger.error(f"无法读取图片: {image_path}")
             raise ValueError(f"无法读取图片: {image_path}")
 
         img = self._crop_content_area(img)
@@ -110,6 +115,49 @@ class BlankPageDetector:
         )
 
         return is_blank_page
+
+    def _read_grayscale_image(self, image_path):
+        """
+        兼容 Windows 路径并处理扫描文件刚写入时的短暂读取失败。
+
+        cv2.imread 在部分 Windows/OpenCV 组合中无法稳定处理非 ASCII
+        路径。先按二进制读取再 imdecode；OpenCV 解码失败时由 Pillow
+        兜底。仅在读取失败时短暂重试，不影响正常高速扫描。
+        """
+        normalized_path = os.path.normpath(os.fspath(image_path))
+        last_error = None
+        file_size = 0
+
+        for attempt in range(self.read_retry_count + 1):
+            try:
+                if os.path.isfile(normalized_path):
+                    file_size = os.path.getsize(normalized_path)
+                    if file_size > 0:
+                        with open(normalized_path, "rb") as image_file:
+                            encoded = np.frombuffer(image_file.read(), dtype=np.uint8)
+                        if encoded.size:
+                            img = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+                            if img is not None:
+                                return img
+            except (OSError, ValueError, cv2.error) as exc:
+                last_error = exc
+
+            try:
+                if file_size > 0:
+                    with Image.open(normalized_path) as pil_image:
+                        return np.array(pil_image.convert("L"))
+            except (OSError, ValueError) as exc:
+                last_error = exc
+
+            if attempt < self.read_retry_count:
+                time.sleep(self.read_retry_delay * (attempt + 1))
+
+        logger.error(
+            f"无法读取图片: {normalized_path}; "
+            f"exists={os.path.isfile(normalized_path)}; size={file_size}; "
+            f"原因: {last_error!r}"
+        )
+        return None
 
     def _crop_content_area(self, img):
         h, w = img.shape[:2]
