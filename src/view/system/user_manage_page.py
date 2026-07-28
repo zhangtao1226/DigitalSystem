@@ -192,8 +192,24 @@ class UserEditDialog(QDialog):
         layout.addLayout(btn_layout)
 
         # 连接信号
-        self.confirm_btn.clicked.connect(self.accept)
+        self.confirm_btn.clicked.connect(self.validate_and_accept)
         self.cancel_btn.clicked.connect(self.reject)
+
+    def validate_and_accept(self):
+        """校验必填项，通过后关闭对话框。"""
+        user_data = self.get_user_data()
+
+        if not self.user and not user_data["password"]:
+            show_warning(self, "输入警告", "密码不能为空，请输入密码！")
+            self.password_edit.setFocus()
+            return
+
+        if not user_data["roles"]:
+            show_warning(self, "输入警告", "角色不能为空，请至少选择一个角色！")
+            self.role_list.setFocus()
+            return
+
+        self.accept()
 
     def fill_user_data(self):
         """填充用户数据"""
@@ -525,8 +541,16 @@ class UserManagePage(QWidget):
                 show_error(self, "输入错误", "用户名至少需要2个字符！")
                 return
 
-            if user_data["password"] and len(user_data["password"]) < 6:
+            if not user_data["password"]:
+                show_warning(self, "输入警告", "密码不能为空，请输入密码！")
+                return
+
+            if len(user_data["password"]) < 6:
                 show_error(self, "输入错误", "密码至少需要6个字符！")
+                return
+
+            if not user_data["roles"]:
+                show_warning(self, "输入警告", "角色不能为空，请至少选择一个角色！")
                 return
 
             # 检查用户名是否已存在
@@ -538,7 +562,7 @@ class UserManagePage(QWidget):
             # 创建新用户
             new_user = {
                 "username": user_data["username"],
-                "password": user_data["password"] or "123456",
+                "password": user_data["password"],
                 "roles": user_data["roles"],
                 "is_active": user_data["is_active"],
                 "create_time": time.strftime("%Y-%m-%d %H:%M:%S"),
