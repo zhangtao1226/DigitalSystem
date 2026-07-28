@@ -1062,6 +1062,8 @@ class ThumbnailLoader(QThread):
 
 
 class ScanWindow(FramelessWindow):
+    PREVIEW_BATCH_SIZE = 24
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("数字化加工系统 - 扫描")
@@ -1097,8 +1099,13 @@ class ScanWindow(FramelessWindow):
         self.selected_image_info = None
         self.preview_widgets = []
         self._path_to_widget: dict = {}
+        self.img_files = []
         self._thumb_loader: ThumbnailLoader = None
         self._live_thumb_loaders = []
+        self._loaded_preview_count = 0
+        self._preview_batch_loading = False
+        self._pending_preview_path = None
+        self._pending_mark_states = {}
 
         self.current_folder_path = ""
         self.base_image_dir = os.path.join(os.path.expanduser("~"), "Pictures")
@@ -1613,6 +1620,9 @@ class ScanWindow(FramelessWindow):
         self.preview_scroll_area = QScrollArea()
         self.preview_scroll_area.setWidgetResizable(True)
         self.preview_scroll_area.setWidget(preview_scroll_widget)
+        self.preview_scroll_area.verticalScrollBar().valueChanged.connect(
+            self._on_preview_scroll
+        )
         self.preview_scroll_area.setStyleSheet("""
             QScrollArea { border: none; background-color: transparent; }
             QScrollBar:vertical {
@@ -1929,6 +1939,10 @@ class ScanWindow(FramelessWindow):
         self.clear_preview_area()
         self.total_scanned = 0
         self.total_pages = 0
+        self._loaded_preview_count = 0
+        self._preview_batch_loading = False
+        self._pending_preview_path = None
+        self._pending_mark_states = {}
 
         # 扫描完成后文件名可能刚被重排，此时必须从文件系统读取最新结果。
         if force_fs:
@@ -1942,15 +1956,100 @@ class ScanWindow(FramelessWindow):
         if not self.img_files:
             return
 
-        for img_path in self.img_files:
-            self._add_preview_placeholder(img_path)
-
-        self._thumb_loader = ThumbnailLoader(self.img_files, parent=self)
-        self._thumb_loader.thumbnail_ready.connect(self._apply_thumbnail)
-        self._thumb_loader.start()
+        # 总页数表示目录中的全部图片数；预览卡片和缩略图按批次创建。
+        self.total_pages = len(self.img_files)
+        self._load_next_preview_batch()
 
         # ── 文件夹加载完成后，回显数据库中已有的未处理质检标记 ──
         QTimer.singleShot(600, lambda p=folder_path: self._restore_mark_states(p))
+
+    def _on_preview_scroll(self, value):
+        """滚动接近底部时，追加下一批预览。"""
+        scroll_bar = self.preview_scroll_area.verticalScrollBar()
+        preload_distance = max(300, scroll_bar.pageStep())
+        if value >= scroll_bar.maximum() - preload_distance:
+            self._load_next_preview_batch()
+
+    def _load_next_preview_batch(self):
+        """创建并异步读取下一批缩略图。"""
+        if (
+            self._preview_batch_loading
+            or self._loaded_preview_count >= len(self.img_files)
+        ):
+            return
+
+        start = self._loaded_preview_count
+        end = min(start + self.PREVIEW_BATCH_SIZE, len(self.img_files))
+        batch_paths = self.img_files[start:end]
+        if not batch_paths:
+            return
+
+        self._preview_batch_loading = True
+        # 保证占位卡片的 index 按目录顺序连续。
+        self.total_scanned = start
+        for img_path in batch_paths:
+            # 扫描过程中即时追加的卡片可能已经存在，避免后续批次重复创建。
+            if img_path in self._path_to_widget:
+                continue
+            self._add_preview_placeholder(img_path)
+            mark_type = self._pending_mark_states.get(img_path)
+            if mark_type:
+                self._set_preview_mark_state(img_path, mark_type)
+
+        self._loaded_preview_count = end
+        # _add_preview_placeholder 会递增计数，此处恢复目录的真实总页数。
+        self.total_scanned = len(self.img_files)
+        self.total_pages = len(self.img_files)
+
+        loader = ThumbnailLoader(batch_paths, parent=self)
+        self._thumb_loader = loader
+        loader.thumbnail_ready.connect(self._apply_thumbnail)
+        loader.finished.connect(
+            lambda current_loader=loader: self._finish_preview_batch(
+                current_loader
+            )
+        )
+        loader.start()
+
+    def _finish_preview_batch(self, loader):
+        if loader is not self._thumb_loader:
+            loader.deleteLater()
+            return
+
+        self._preview_batch_loading = False
+        self._thumb_loader = None
+        loader.deleteLater()
+
+        pending_path = self._pending_preview_path
+        if pending_path:
+            target_index = self._image_path_index(pending_path)
+            if target_index >= self._loaded_preview_count:
+                self._load_next_preview_batch()
+                return
+            self._pending_preview_path = None
+            QTimer.singleShot(
+                0, lambda path=pending_path: self.scroll_preview_to_path(path)
+            )
+
+    def _image_path_index(self, image_path):
+        try:
+            return self.img_files.index(image_path)
+        except ValueError:
+            return -1
+
+    def _ensure_preview_path_loaded(self, image_path):
+        """按批加载到目标图片，加载完成后由批次回调负责定位。"""
+        if image_path in self._path_to_widget:
+            self.scroll_preview_to_path(image_path)
+            return
+
+        target_index = self._image_path_index(image_path)
+        if target_index < 0:
+            return
+
+        self._pending_preview_path = image_path
+        if not self._preview_batch_loading:
+            self._load_next_preview_batch()
 
     @Slot(str, object)
     def _apply_thumbnail(self, image_path: str, image):
@@ -2016,9 +2115,9 @@ class ScanWindow(FramelessWindow):
         )
 
     def scroll_preview_to_path(self, image_path: str):
-        print(f"1111, {image_path}")
         widget_info = self._path_to_widget.get(image_path)
         if not widget_info:
+            self._ensure_preview_path_loaded(image_path)
             return
         widget = widget_info.get("widget")
         info = widget_info.get("info")
@@ -3431,8 +3530,9 @@ class ScanWindow(FramelessWindow):
         if image_path in self.img_files:
             self.img_files.remove(image_path)
 
-        self.total_scanned = len(self.preview_widgets)
-        self.total_pages = len(self.preview_widgets)
+        self._loaded_preview_count = len(self.preview_widgets)
+        self.total_scanned = len(self.img_files)
+        self.total_pages = len(self.img_files)
         self.selected_preview_widget = None
         self.selected_image_info = None
         self.current_selected_image = None
@@ -3454,8 +3554,12 @@ class ScanWindow(FramelessWindow):
                 task_id=self.task_info.id,
                 folder_path=folder_path,
             )
+            if folder_path != self.current_folder_path:
+                return
+            self._pending_mark_states = {}
             for mark in pending_marks:
                 img_path = os.path.join(folder_path, mark.scan_file)
+                self._pending_mark_states[img_path] = mark.mark_type
                 self._set_preview_mark_state(img_path, mark.mark_type)
                 self._set_tree_mark_state(img_path, has_mark=True)
         except Exception as e:
