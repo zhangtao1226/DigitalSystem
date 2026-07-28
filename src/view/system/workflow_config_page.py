@@ -9,7 +9,7 @@ from PySide6.QtGui import (
     QFont, QColor, QBrush,
 )
 from PySide6.QtWidgets import (
-    QVBoxLayout, QHBoxLayout, QWidget, QGroupBox, QListWidgetItem
+    QVBoxLayout, QHBoxLayout, QWidget, QGroupBox, QListWidgetItem, QSizePolicy
 )
 from PySide6.QtCore import (
     Qt, Signal,
@@ -112,8 +112,10 @@ class WorkflowConfiguration(QWidget):
 
         self.available_list = ListWidget()
         self.available_list.setSelectionMode(ListWidget.MultiSelection)
-        self.available_list.setFixedSize(380, 580)
+        self.available_list.setMinimumSize(380, 260)
+        self.available_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.available_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.available_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.available_list.itemSelectionChanged.connect(self.on_available_selection_changed)
         self.available_list.setStyleSheet("""
             ListWidget {
@@ -214,8 +216,10 @@ class WorkflowConfiguration(QWidget):
 
         self.selected_list = ListWidget()
         self.selected_list.setSelectionMode(ListWidget.MultiSelection)
-        self.selected_list.setFixedSize(380, 580)
+        self.selected_list.setMinimumSize(380, 260)
+        self.selected_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.selected_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.selected_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.selected_list.itemSelectionChanged.connect(self.on_selected_selection_changed)
         self.selected_list.setStyleSheet("""
             ListWidget {
@@ -258,7 +262,7 @@ class WorkflowConfiguration(QWidget):
 
         workflow_area.addWidget(selected_group)
 
-        main_layout.addLayout(workflow_area)
+        main_layout.addLayout(workflow_area, 1)
         order_hint = BodyLabel("提示：工作流将按照顺序执行")
         order_hint.setAlignment(Qt.AlignCenter)
         order_hint.setStyleSheet("""
