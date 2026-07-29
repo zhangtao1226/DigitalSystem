@@ -12,13 +12,16 @@ import sys
 import time
 from datetime import datetime
 
-from PySide6.QtCore import QDir, QMimeData, QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtCore import (
+    QDir, QMimeData, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal, Slot
+)
 from PySide6.QtGui import (
     QColor,
     QDrag,
     QFont,
     QIcon,
     QImage,
+    QImageReader,
     QKeyEvent,
     QPainter,
     QPixmap,
@@ -36,6 +39,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -51,6 +55,7 @@ from qfluentwidgets import (
     PushButton,
     Theme,
     setTheme,
+    ComboBox
 )
 from qframelesswindow import FramelessWindow
 from src.core.cache_manager import global_cache
@@ -64,8 +69,147 @@ from src.services.task_service import task_service
 from src.utils.ImageProcessor import ImageProcessor
 from src.utils.LoggerDetector import logger
 from src.utils.NotificationTool import show_error, show_info, show_success, show_warning
+from src.view.common.CommonProgressBar import CommonProgressDialog
 
 IMG_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+
+class FolderTreeWidget(QTreeWidget):
+    """区分目录正文点击与左侧展开/收起标志点击。"""
+
+    contentClicked = Signal(object, int)
+
+    def mousePressEvent(self, event):
+        item = self.itemAt(event.position().toPoint())
+        column = self.columnAt(int(event.position().x()))
+        clicked_content = False
+        if item is not None:
+            clicked_content = (
+                event.button() == Qt.LeftButton
+                and event.position().x() >= self.visualItemRect(item).left()
+            )
+
+        super().mousePressEvent(event)
+
+        if clicked_content:
+            self.contentClicked.emit(item, max(0, column))
+
+
+class AspectRatioImageLabel(QLabel):
+    """始终完整、居中、等比例绘制图片的预览组件。"""
+
+    def __init__(self, parent=None, safe_margin=0):
+        super().__init__(parent)
+        self._source_pixmap = QPixmap()
+        self._safe_margin = safe_margin
+        self.setAlignment(Qt.AlignCenter)
+        self.setScaledContents(False)
+
+    def setPixmap(self, pixmap):
+        self._source_pixmap = QPixmap(pixmap) if pixmap is not None else QPixmap()
+        QLabel.setPixmap(self, QPixmap())
+        QLabel.setText(self, "")
+        self.update()
+
+    def setText(self, text):
+        self._source_pixmap = QPixmap()
+        QLabel.setPixmap(self, QPixmap())
+        QLabel.setText(self, text)
+        self.update()
+
+    def clear(self):
+        self._source_pixmap = QPixmap()
+        super().clear()
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._source_pixmap.isNull():
+            return
+
+        available_rect = self.contentsRect().adjusted(
+            self._safe_margin,
+            self._safe_margin,
+            -self._safe_margin,
+            -self._safe_margin,
+        )
+        if available_rect.width() <= 0 or available_rect.height() <= 0:
+            return
+
+        scaled_size = self._source_pixmap.size().scaled(
+            available_rect.size(), Qt.KeepAspectRatio
+        )
+        target_rect = QRect(QPoint(0, 0), scaled_size)
+        target_rect.moveCenter(available_rect.center())
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(target_rect, self._source_pixmap)
+
+
+class ThumbnailLoader(QThread):
+    """在后台按当前卡片尺寸读取缩略图，避免切换目录时阻塞界面。"""
+
+    thumbnail_ready = Signal(str, object)
+
+    def __init__(self, image_paths, thumb_size, parent=None):
+        super().__init__(parent)
+        self._paths = image_paths
+        self._thumb_size = thumb_size
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        for path in self._paths:
+            if self._cancelled:
+                break
+            try:
+                reader = QImageReader(path)
+                reader.setAutoTransform(True)
+                source_size = reader.size()
+                if source_size.isValid():
+                    reader.setScaledSize(
+                        source_size.scaled(self._thumb_size, Qt.KeepAspectRatio)
+                    )
+                image = reader.read()
+                if image.isNull():
+                    image = None
+            except Exception:
+                image = None
+            self.thumbnail_ready.emit(path, image)
+
+
+class PartsWorker(QThread):
+    """后台执行分件任务并转发逐页进度。"""
+
+    progress_changed = Signal(int, int, str)
+    result_ready = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, dir_path, split_type, option_value, parent=None):
+        super().__init__(parent)
+        self.dir_path = dir_path
+        self.split_type = split_type
+        self.option_value = option_value
+
+    def run(self):
+        try:
+            from src.utils.PartsDetector import PartsDetector
+
+            detector = PartsDetector(dir_path=self.dir_path)
+            callback = lambda current, total, message: self.progress_changed.emit(
+                current, total, message
+            )
+            if self.split_type == "目录":
+                result = detector.catalog(self.option_value, callback)
+            else:
+                result = detector.stamp_parts(self.option_value, callback)
+            self.result_ready.emit(result)
+        except Exception as exc:
+            logger.exception(f"分件任务执行失败: {exc}")
+            self.failed.emit(str(exc))
 
 
 class ImagePreviewDialog(QDialog):
@@ -354,6 +498,15 @@ class BulkWindow(FramelessWindow):
         self.selected_preview_widget = None
         self.selected_image_info = None
         self.preview_widgets = []
+        self._thumb_loader = None
+        self.img_files = []
+        self._lazy_batch_size = 24
+        self._loaded_count = 0
+        self._is_loading_batch = False
+        self._target_load_count = 0
+        self._pending_scroll_path = None
+        self._parts_worker = None
+        self._progress_dialog = None
 
         self.current_folder_path = ""
         self.current_image = None
@@ -660,7 +813,7 @@ class BulkWindow(FramelessWindow):
         tree_header_layout.addWidget(self.refresh_tree_btn)
         tree_layout.addLayout(tree_header_layout)
 
-        self.file_tree = QTreeWidget()
+        self.file_tree = FolderTreeWidget()
         self.file_tree.setHeaderHidden(True)  # 隐藏列头
         self.file_tree.setColumnCount(1)
         self.file_tree.setIndentation(18)  # 缩进宽度
@@ -695,14 +848,6 @@ class BulkWindow(FramelessWindow):
             QTreeWidget::branch:!has-children:!has-siblings:adjoins-item {
                 border-image: none;
             }
-            QTreeWidget::branch:has-children:!has-siblings:closed,
-            QTreeWidget::branch:closed:has-children:has-siblings {
-                image: none;
-            }
-            QTreeWidget::branch:open:has-children:!has-siblings,
-            QTreeWidget::branch:open:has-children:has-siblings {
-                image: none;
-            }
         """)
         self.file_tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self.file_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -713,7 +858,7 @@ class BulkWindow(FramelessWindow):
         self.file_tree.viewport().setAcceptDrops(True)
         self._install_tree_drop_handlers()
 
-        self.file_tree.itemClicked.connect(self.on_tree_item_clicked)
+        self.file_tree.contentClicked.connect(self.on_tree_item_clicked)
 
         tree_layout.addWidget(self.file_tree)
         core_horizontal_splitter.addWidget(tree_container)
@@ -730,27 +875,34 @@ class BulkWindow(FramelessWindow):
         preview_layout_right.setContentsMargins(0, 0, 0, 0)
         preview_layout_right.setSpacing(0)
 
-        # ── 缩放工具栏（样式对齐 image_window.py）──
+        # ── 图片数量与缩放工具栏 ──
         zoom_bar = QWidget()
-        zoom_bar.setFixedHeight(46)
+        zoom_bar.setFixedHeight(52)
         zoom_bar.setStyleSheet("background:transparent;")
         zoom_bar_lay = QHBoxLayout(zoom_bar)
-        zoom_bar_lay.setContentsMargins(12, 6, 12, 6)
-        zoom_bar_lay.setSpacing(8)
+        zoom_bar_lay.setContentsMargins(16, 6, 16, 6)
+        zoom_bar_lay.setSpacing(12)
+
+        self._image_count_label = QLabel(f"共 {self.total_pages} 张")
+        self._image_count_label.setStyleSheet("""
+            QLabel {
+                background-color: #e8f5e9;
+                color: #2e7d32;
+                border-radius: 12px;
+                padding: 6px 16px;
+                font-size: 14px;
+                font-weight: 500;
+            }
+        """)
+        zoom_bar_lay.addWidget(self._image_count_label)
         zoom_bar_lay.addStretch()
 
-        zoom_tip = QLabel("Ctrl + 滚轮缩放")
-        zoom_tip.setStyleSheet(
-            "font-size:11px;color:#aaa;font-family:'Microsoft YaHei';"
-        )
-        zoom_bar_lay.addWidget(zoom_tip)
-
-        self._zoom_out_btn = PushButton("－")
-        self._zoom_out_btn.setFixedSize(32, 32)
+        self._zoom_out_btn = PushButton("-")
+        self._zoom_out_btn.setFixedSize(40, 34)
         self._zoom_out_btn.setToolTip("缩小（Ctrl + 鼠标滚轮向下）")
         self._zoom_out_btn.setCursor(Qt.PointingHandCursor)
         self._zoom_out_btn.setStyleSheet("""
-            PushButton { font-size:18px; font-weight:bold;
+            PushButton { font-size:22px; font-weight:bold; padding:0;
                 border-radius:6px; background:#f0f0f0; border:1px solid #ddd; }
             PushButton:hover { background:#e0e0e0; }
         """)
@@ -758,19 +910,20 @@ class BulkWindow(FramelessWindow):
         zoom_bar_lay.addWidget(self._zoom_out_btn)
 
         self._zoom_label = QLabel(f"{self._thumb_size}px")
-        self._zoom_label.setFixedWidth(52)
+        self._zoom_label.setFixedWidth(72)
         self._zoom_label.setAlignment(Qt.AlignCenter)
         self._zoom_label.setStyleSheet(
-            "font-size:12px;color:#888;font-family:'Microsoft YaHei';"
+            "font-size:12px;color:#666;font-family:'Microsoft YaHei';"
+            "padding:0;margin:0;border:none;"
         )
         zoom_bar_lay.addWidget(self._zoom_label)
 
-        self._zoom_in_btn = PushButton("＋")
-        self._zoom_in_btn.setFixedSize(32, 32)
+        self._zoom_in_btn = PushButton("+")
+        self._zoom_in_btn.setFixedSize(40, 34)
         self._zoom_in_btn.setToolTip("放大（Ctrl + 鼠标滚轮向上）")
         self._zoom_in_btn.setCursor(Qt.PointingHandCursor)
         self._zoom_in_btn.setStyleSheet("""
-            PushButton { font-size:18px; font-weight:bold;
+            PushButton { font-size:22px; font-weight:bold; padding:0;
                 border-radius:6px; background:#f0f0f0; border:1px solid #ddd; }
             PushButton:hover { background:#e0e0e0; }
         """)
@@ -804,6 +957,9 @@ class BulkWindow(FramelessWindow):
             }
         """)
         self._scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._scroll_area.verticalScrollBar().valueChanged.connect(
+            self._on_preview_scroll
+        )
 
         # ── 独立滚轮过滤器（Ctrl + 滚轮缩放）──
         from PySide6.QtCore import QEvent as _QEvent
@@ -914,6 +1070,16 @@ class BulkWindow(FramelessWindow):
         self.tree_root_path = target_path
         self.file_tree.clear()
 
+        root_name = os.path.basename(target_path) or target_path
+        root_item = QTreeWidgetItem(self.file_tree)
+        root_item.setText(0, f"🗂  {root_name}")
+        root_item.setData(0, Qt.UserRole, {"type": "root", "path": target_path})
+        root_item.setForeground(0, QColor("#1a6fac"))
+        root_font = QFont()
+        root_font.setBold(True)
+        root_font.setPointSize(11)
+        root_item.setFont(0, root_font)
+
         try:
             entries = sorted(os.listdir(target_path))
         except PermissionError:
@@ -930,7 +1096,7 @@ class BulkWindow(FramelessWindow):
 
                 if os.path.isdir(entry_path):
                     folder_item = self._build_tree_item_folder(
-                        self.file_tree, entry, entry_path
+                        root_item, entry, entry_path
                     )
                     has_any = True
                     try:
@@ -943,19 +1109,34 @@ class BulkWindow(FramelessWindow):
                         ext = os.path.splitext(sub_entry)[1].lower()
 
                         if os.path.isdir(sub_path):
-                            self._build_tree_item_folder(
+                            sub_folder_item = self._build_tree_item_folder(
                                 folder_item, sub_entry, sub_path
                             )
+                            try:
+                                for third_entry in sorted(os.listdir(sub_path)):
+                                    third_path = os.path.join(sub_path, third_entry)
+                                    if (
+                                        os.path.isfile(third_path)
+                                        and os.path.splitext(third_entry)[1].lower()
+                                        in IMG_EXTENSIONS
+                                    ):
+                                        self._build_tree_item_file(
+                                            sub_folder_item,
+                                            third_entry,
+                                            third_path,
+                                        )
+                            except PermissionError:
+                                pass
                         elif ext in IMG_EXTENSIONS:
                             self._build_tree_item_file(folder_item, sub_entry, sub_path)
 
                 elif os.path.isfile(entry_path):
                     ext = os.path.splitext(entry)[1].lower()
                     if ext in IMG_EXTENSIONS:
-                        self._build_tree_item_file(self.file_tree, entry, entry_path)
+                        self._build_tree_item_file(root_item, entry, entry_path)
                         has_any = True
 
-        self.file_tree.expandAll()
+        self.file_tree.collapseAll()
 
         if has_any:
             show_success(
@@ -970,8 +1151,23 @@ class BulkWindow(FramelessWindow):
     def refresh_file_tree(self):
         if self.tree_root_path and os.path.exists(self.tree_root_path):
             self.update_file_tree_path(self.tree_root_path)
+            self.expand_file_tree_to_level(1)
         else:
             show_warning(self, "刷新失败", "根路径无效，请先在设置中指定保存路径")
+
+    def expand_file_tree_to_level(self, max_level=2):
+        """展开到指定目录层级，更深层目录保持收起。"""
+        root = self.file_tree.invisibleRootItem()
+
+        def _expand(parent, level):
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                data = child.data(0, Qt.UserRole) or {}
+                if data.get("type") in ("root", "folder"):
+                    child.setExpanded(level <= max_level)
+                    _expand(child, level + 1)
+
+        _expand(root, 1)
 
     def select_tree_item_by_path(self, target_path):
         root = self.file_tree.invisibleRootItem()
@@ -999,6 +1195,9 @@ class BulkWindow(FramelessWindow):
         item_type = data.get("type")
         item_path = data.get("path")
 
+        if item_type == "root":
+            return
+
         if item_type == "folder":
             folder_name = os.path.basename(item_path)
             self.current_folder_path = item_path
@@ -1012,15 +1211,48 @@ class BulkWindow(FramelessWindow):
             if parent_path != self.current_folder_path:
                 self.current_folder_path = parent_path
                 self.load_folder_images(parent_path)
+                QTimer.singleShot(
+                    50, lambda path=item_path: self.scroll_preview_to_path(path)
+                )
+            else:
+                self.scroll_preview_to_path(item_path)
 
-            file_name = os.path.splitext(os.path.basename(item_path))[0]
-            print(f"选中文件夹： {file_name}")
-            for widget_info in self.preview_widgets:
-                if isinstance(widget_info, dict):
-                    info = widget_info.get("info", {})
-                    if info.get("path") == item_path:
-                        self.on_preview_clicked(widget_info["widget"], info)
-                        break
+    def scroll_preview_to_path(self, image_path):
+        """选中目录树图片时，同步定位右侧预览卡片。"""
+        widget_info = self._path_to_widget.get(image_path)
+        if not isinstance(widget_info, dict):
+            self._ensure_image_loaded_and_scroll(image_path)
+            return
+        widget = widget_info.get("widget")
+        info = widget_info.get("info")
+        if widget is None or not info:
+            return
+        self.on_preview_clicked(widget, info)
+        scroll_widget = self._scroll_area.widget()
+        if scroll_widget is None:
+            return
+        pos_in_scroll = widget.mapTo(scroll_widget, widget.rect().topLeft())
+        self._scroll_area.ensureVisible(
+            pos_in_scroll.x(),
+            pos_in_scroll.y(),
+            widget.width(),
+            widget.height(),
+        )
+
+    def _ensure_image_loaded_and_scroll(self, image_path):
+        """按批加载到目标图片所在批次，完成后自动定位。"""
+        try:
+            image_index = self.img_files.index(image_path)
+        except ValueError:
+            return
+
+        self._pending_scroll_path = image_path
+        self._target_load_count = min(
+            len(self.img_files),
+            ((image_index // self._lazy_batch_size) + 1) * self._lazy_batch_size,
+        )
+        if not self._is_loading_batch:
+            self._load_next_image_batch()
 
     def refresh_folder_info(self):
         if self.current_folder_path and os.path.exists(self.current_folder_path):
@@ -1035,11 +1267,16 @@ class BulkWindow(FramelessWindow):
                 return
 
     def load_folder_images(self, folder_path):
+        self._stop_thumbnail_loader()
         self.clear_preview_area()
         self.total_scanned = 0
         self.total_pages = 0
+        self._loaded_count = 0
+        self._target_load_count = 0
+        self._pending_scroll_path = None
+        self.img_files = []
+        self._update_image_load_status()
 
-        img_files = []
         try:
             for f in sorted(os.listdir(folder_path)):
                 fp = os.path.join(folder_path, f)
@@ -1047,19 +1284,127 @@ class BulkWindow(FramelessWindow):
                     os.path.isfile(fp)
                     and os.path.splitext(f)[1].lower() in IMG_EXTENSIONS
                 ):
-                    img_files.append(fp)
+                    self.img_files.append(fp)
         except PermissionError:
             show_warning(self, "权限错误", "无法访问该文件夹，请检查权限")
             return
 
-        for img_path in img_files:
-            self.add_scan_preview(custom_path=img_path)
-        self.total_pages_label.setText(f"总页数: {self.total_pages}")
+        self.total_pages = len(self.img_files)
+        self._target_load_count = min(self._lazy_batch_size, self.total_pages)
+        self._update_image_load_status()
+        self._load_next_image_batch()
 
-        # 回显该文件夹下已有的未修复质检标记
-        QTimer.singleShot(
-            200, lambda p=folder_path: self._restore_folder_mark_states(p)
+    def _update_image_load_status(self):
+        self.total_pages_label.setText(f"总页数: {self.total_pages}")
+        self._image_count_label.setText(
+            f"已加载 {self._loaded_count} / 共 {self.total_pages} 张"
         )
+
+    def _load_next_image_batch(self):
+        """创建下一批卡片，并异步加载这一批的缩略图。"""
+        if self._is_loading_batch or self._loaded_count >= len(self.img_files):
+            if self._pending_scroll_path in self._path_to_widget:
+                pending_path = self._pending_scroll_path
+                self._pending_scroll_path = None
+                QTimer.singleShot(
+                    0, lambda path=pending_path: self.scroll_preview_to_path(path)
+                )
+            return
+
+        batch_end = min(
+            self._loaded_count + self._lazy_batch_size,
+            len(self.img_files),
+        )
+        batch_paths = self.img_files[self._loaded_count:batch_end]
+        for img_path in batch_paths:
+            self.add_scan_preview(custom_path=img_path, defer_load=True)
+
+        self._loaded_count = batch_end
+        self._is_loading_batch = True
+        self._update_image_load_status()
+
+        thumb_size = QSize(
+            self._THUMB_MAX, int(self._THUMB_MAX * self._thumb_h_ratio)
+        )
+        self._thumb_loader = ThumbnailLoader(
+            batch_paths, thumb_size, parent=self
+        )
+        self._thumb_loader.thumbnail_ready.connect(self._apply_thumbnail)
+        self._thumb_loader.finished.connect(self._on_thumbnail_loader_finished)
+        self._thumb_loader.start()
+
+    def _on_preview_scroll(self, value):
+        """滚动接近底部时加载下一批图片。"""
+        if self._is_loading_batch or self._loaded_count >= len(self.img_files):
+            return
+        scroll_bar = self._scroll_area.verticalScrollBar()
+        threshold = max(200, scroll_bar.pageStep() // 2)
+        if scroll_bar.maximum() - value <= threshold:
+            self._target_load_count = min(
+                self._loaded_count + self._lazy_batch_size,
+                len(self.img_files),
+            )
+            self._load_next_image_batch()
+
+    def _stop_thumbnail_loader(self):
+        loader = self._thumb_loader
+        if loader is None:
+            return
+        if loader.isRunning():
+            loader.cancel()
+            loader.quit()
+            if not loader.wait(5000):
+                logger.warning("分件 ThumbnailLoader 未能在 5 秒内退出")
+        loader.deleteLater()
+        self._thumb_loader = None
+        self._is_loading_batch = False
+
+    def _on_thumbnail_loader_finished(self):
+        loader = self.sender()
+        if loader is self._thumb_loader:
+            self._thumb_loader = None
+        self._is_loading_batch = False
+        loader.deleteLater()
+        if self.current_folder_path:
+            QTimer.singleShot(
+                100,
+                lambda path=self.current_folder_path:
+                    self._restore_folder_mark_states(path),
+            )
+
+        if self._loaded_count < self._target_load_count:
+            QTimer.singleShot(0, self._load_next_image_batch)
+            return
+
+        if self._pending_scroll_path in self._path_to_widget:
+            pending_path = self._pending_scroll_path
+            self._pending_scroll_path = None
+            QTimer.singleShot(
+                0, lambda path=pending_path: self.scroll_preview_to_path(path)
+            )
+            return
+
+        QTimer.singleShot(
+            0,
+            lambda: self._on_preview_scroll(
+                self._scroll_area.verticalScrollBar().value()
+            ),
+        )
+
+    @Slot(str, object)
+    def _apply_thumbnail(self, image_path, image):
+        widget_info = self._path_to_widget.get(image_path)
+        if not isinstance(widget_info, dict):
+            return
+        preview_label = widget_info.get("preview_label")
+        if preview_label is None:
+            return
+        if image is not None and not image.isNull():
+            preview_label.setPixmap(QPixmap.fromImage(image))
+        else:
+            self._draw_placeholder(
+                preview_label, f"加载失败\n{os.path.basename(image_path)}"
+            )
 
     def clear_preview_area(self):
         for i in reversed(range(self.preview_flow_layout.count())):
@@ -1125,9 +1470,8 @@ class BulkWindow(FramelessWindow):
                     )
                     break
 
-    def add_scan_preview(self, custom_path=None):
-        self.total_pages += 1
-        self.total_pages_label.setText(f"总页数: {self.total_pages}")
+    def add_scan_preview(self, custom_path=None, defer_load=False):
+        self.total_scanned += 1
 
         tw = self._thumb_size
         th = int(tw * self._thumb_h_ratio)
@@ -1150,12 +1494,14 @@ class BulkWindow(FramelessWindow):
         img_container.setFixedSize(tw, th)
         img_container.setStyleSheet("background:transparent;")
 
-        preview_label = QLabel(img_container)
+        preview_label = AspectRatioImageLabel(img_container)
         preview_label.setFixedSize(tw, th)
         preview_label.setStyleSheet(
             "QLabel { border-radius: 4px; background-color: #f5f5f5; }"
         )
         preview_label.setAlignment(Qt.AlignCenter)
+        if defer_load:
+            preview_label.setText("...")
 
         # ── 标记角标（默认隐藏）──
         mark_badge = QLabel("⚑ 已标记", img_container)
@@ -1176,21 +1522,15 @@ class BulkWindow(FramelessWindow):
             image_path = self.scan_image_paths[image_index]
 
         image_exists = os.path.exists(image_path)
-        if image_exists:
+        if image_exists and not defer_load:
             pixmap = QPixmap(image_path)
             if not pixmap.isNull():
-                preview_label.setPixmap(
-                    pixmap.scaled(
-                        preview_label.size(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation,
-                    )
-                )
+                preview_label.setPixmap(pixmap)
             else:
                 self._draw_placeholder(
                     preview_label, f"加载失败\n{os.path.basename(image_path)}"
                 )
-        else:
+        elif not defer_load:
             self._draw_placeholder(
                 preview_label, f"文件不存在\n{os.path.basename(image_path)}"
             )
@@ -1579,22 +1919,12 @@ class BulkWindow(FramelessWindow):
                 continue
             w = entry.get("widget")
             pl = entry.get("preview_label")
-            info = entry.get("info", {})
             if w:
                 w.setFixedSize(tw + 10, th + 30)
             if pl:
                 # preview_label 的父控件即 img_container
                 pl.parent().setFixedSize(tw, th)
                 pl.setFixedSize(tw, th)
-                img_path = info.get("path", "")
-                if img_path and os.path.exists(img_path):
-                    px = QPixmap(img_path)
-                    if not px.isNull():
-                        pl.setPixmap(
-                            px.scaled(
-                                tw, th, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                            )
-                        )
 
     # ──────────────────── 标记 UI 状态管理 ────────────────────
 
@@ -1872,7 +2202,6 @@ class BulkWindow(FramelessWindow):
 
         input_widget = QWidget()
         input_widget.setLayout(input_row)
-        w.textLayout.addWidget(input_widget)
 
         stamp_list = [
             item.template_name for item in archive_stamp_service.get_all()
@@ -1894,11 +2223,19 @@ class BulkWindow(FramelessWindow):
 
         stamp_widget = QWidget()
         stamp_widget.setLayout(stamp_row)
-        w.textLayout.addWidget(stamp_widget)
+
+        # 两种分件配置共用同一块区域，切换时不改变弹框尺寸。
+        option_stack = QStackedWidget()
+        option_stack.setMinimumWidth(430)
+        option_stack.setFixedHeight(52)
+        option_stack.addWidget(input_widget)
+        option_stack.addWidget(stamp_widget)
+        w.textLayout.addWidget(option_stack)
 
         def update_option_visible(split_type):
-            input_widget.setVisible(split_type == "目录")
-            stamp_widget.setVisible(split_type == "归档章")
+            option_stack.setCurrentWidget(
+                input_widget if split_type == "目录" else stamp_widget
+            )
 
         split_type_combo.currentTextChanged.connect(update_option_visible)
         update_option_visible(split_type_combo.currentText())
@@ -1910,10 +2247,6 @@ class BulkWindow(FramelessWindow):
             if len(images_list) == 0:
                 show_error(self, "分件失败", f"当前文件夹下没有任何图片")
                 return
-
-            from src.utils.PartsDetector import PartsDetector
-
-            parts_detector = PartsDetector(dir_path=self.current_folder_path)
 
             if selected_split_type == "目录":
                 # 目录分件
@@ -1927,14 +2260,11 @@ class BulkWindow(FramelessWindow):
                     show_warning(self, "警告", "导入分件目录不存在")
                     return
 
-                result = parts_detector.catalog(self.dir_input_path)
-
-                if result["code"] > 0:
-                    show_success(self, "提示", result["message"])
-                    self.refresh_file_tree()
-                    self.load_folder_images(self.current_folder_path)
-                else:
-                    show_error(self, "分件失败", result["message"])
+                self._start_parts_process(
+                    selected_split_type,
+                    self.dir_input_path,
+                    len(images_list),
+                )
                 return
 
             elif selected_split_type == "归档章":
@@ -1945,15 +2275,83 @@ class BulkWindow(FramelessWindow):
                     show_warning(self, "分件失败", "未选择归档章模板，请先选择模板")
                     return
 
-                result = parts_detector.stamp_parts(self.stamp_combo_value)
-
-                if result["code"] > 0:
-                    show_success(self, "提示", result["message"])
-                    self.refresh_file_tree()
-                    self.load_folder_images(self.current_folder_path)
-                else:
-                    show_error(self, "分件失败", result["message"])
+                self._start_parts_process(
+                    selected_split_type,
+                    self.stamp_combo_value,
+                    len(images_list),
+                )
                 return
+
+    def _start_parts_process(self, split_type, option_value, total):
+        """使用成品输出同款进度框，在后台执行分件。"""
+        if self._parts_worker and self._parts_worker.isRunning():
+            show_warning(self, "分件提示", "已有分件任务正在执行，请稍候")
+            return
+
+        title = f"{split_type}分件进度"
+        self._progress_dialog = CommonProgressDialog(
+            title=title,
+            message="正在准备分件任务...",
+            show_cancel=False,
+            parent=self,
+        )
+        self._progress_dialog.set_progress(0, max(1, total), "正在准备分件任务...")
+        self._progress_dialog.show()
+        self._progress_dialog.raise_()
+        self._progress_dialog.activateWindow()
+        self._progress_dialog.repaint()
+
+        self._parts_worker = PartsWorker(
+            self.current_folder_path,
+            split_type,
+            option_value,
+            parent=self,
+        )
+        self._parts_worker.progress_changed.connect(self._update_parts_progress)
+        self._parts_worker.result_ready.connect(self._on_parts_finished)
+        self._parts_worker.failed.connect(self._on_parts_failed)
+        self._parts_worker.finished.connect(self._cleanup_parts_worker)
+        self._parts_worker.start()
+
+    @Slot(int, int, str)
+    def _update_parts_progress(self, current, total, message):
+        if self._progress_dialog:
+            self._progress_dialog.set_progress(
+                current, max(1, total), message
+            )
+
+    @Slot(object)
+    def _on_parts_finished(self, result):
+        if result["code"] > 0:
+            self._finish_parts_progress(result["message"])
+            show_success(self, "提示", result["message"])
+            self.refresh_file_tree()
+            self.load_folder_images(self.current_folder_path)
+        else:
+            self._finish_parts_progress("分件失败")
+            show_error(self, "分件失败", result["message"])
+
+    @Slot(str)
+    def _on_parts_failed(self, message):
+        self._finish_parts_progress("分件失败")
+        show_error(self, "分件失败", message or "分件任务执行失败")
+
+    def _finish_parts_progress(self, message):
+        if not self._progress_dialog:
+            return
+        progress_dialog = self._progress_dialog
+        progress_dialog.finish(message)
+        QTimer.singleShot(800, progress_dialog.close)
+        QTimer.singleShot(800, self._clear_parts_progress_dialog)
+
+    def _clear_parts_progress_dialog(self):
+        self._progress_dialog = None
+
+    def _cleanup_parts_worker(self):
+        worker = self._parts_worker
+        self._parts_worker = None
+        if worker:
+            worker.deleteLater()
 
     def get_dir_all_images(self, dir_path):
         try:
@@ -2045,7 +2443,13 @@ class BulkWindow(FramelessWindow):
             self.user_label.setText("未登录")
 
     def closeEvent(self, event):
+        if self._parts_worker and self._parts_worker.isRunning():
+            show_warning(self, "分件进行中", "请等待当前分件任务完成后再退出")
+            event.ignore()
+            return
+
         if self._is_navigation:
+            self._stop_thumbnail_loader()
             event.accept()
             return
 
@@ -2056,8 +2460,10 @@ class BulkWindow(FramelessWindow):
 
             if box.exec():
                 self._is_app_exiting = True
+                self._stop_thumbnail_loader()
                 event.accept()
             else:
                 event.ignore()
         else:
+            self._stop_thumbnail_loader()
             event.accept()

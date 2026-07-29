@@ -17,24 +17,32 @@ from src.utils.ResultDetector import Result
 
 class StampTableCheck:
 
-    def has_stamp(self, image_path:str) -> bool:
-        result = self.detect_stamp(image_path)
+    def has_stamp(self, image_source) -> bool:
+        result = self.detect_stamp(image_source)
         print(f"result: {result}")
         return result['found']
 
-    def detect_stamp(self, image_path:str, debug=False) -> Result:
-
-        img = cv2.imread(image_path)
+    def detect_stamp(self, image_source, debug=False) -> Result:
+        if isinstance(image_source, np.ndarray):
+            img = image_source
+            source_name = "<内存裁剪图>"
+        else:
+            img = cv2.imread(image_source)
+            source_name = image_source
         if img is None:
             return {'found': False, 'method': None, 'bbox': None,
                     'rows': 0, 'cols': 0, 'cells': 0}
 
         if debug:
             ih, iw = img.shape[:2]
-            print(f"\n🔍 [{image_path}] ({iw}x{ih})")
+            print(f"\n🔍 [{source_name}] ({iw}x{ih})")
 
-        # 优先颜色检测（快速精准）
-        result = self._detect_color_stamp(img, debug=debug)
+        # 优先检测红色线条构成的网格，避免把红头字体误判为归档章。
+        result = self._detect_strict_red_grid(img, debug=debug)
+
+        # 严格网格未命中时，再使用宽松颜色检测兼容浅色扫描章。
+        if result is None:
+            result = self._detect_color_stamp(img, debug=debug)
 
         # 颜色检测失败则用结构检测
         if result is None:
@@ -49,6 +57,53 @@ class StampTableCheck:
                     'rows': 0, 'cols': 0, 'cells': 0}
 
         return {'found': True, **result}
+
+    def _detect_strict_red_grid(self, img: np.ndarray, debug=False) -> dict | None:
+        """检测红色线条构成的紧凑多列表格，排除只有红头文字的页面。"""
+        ih, iw = img.shape[:2]
+        blue, green, red = cv2.split(img)
+        red_i16 = red.astype(np.int16)
+        other_max = np.maximum(green, blue).astype(np.int16)
+
+        # 红色必须明显强于另外两个通道，轻微偏色和屏幕纹理不会进入。
+        raw_mask = (
+            ((red_i16 - other_max) > 20) & (red > 100)
+        ).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+            if cv2.contourArea(contour) < 500:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if not self._is_valid_stamp(img, x, y, w, h, color_mask=mask):
+                continue
+
+            pad = 5
+            rx1, ry1 = max(0, x - pad), max(0, y - pad)
+            rx2, ry2 = min(iw, x + w + pad), min(ih, y + h + pad)
+            grid = self._count_cells_from_mask(mask[ry1:ry2, rx1:rx2])
+            result = {
+                'method': 'red_grid',
+                'bbox': (
+                    max(0, x - 20),
+                    max(0, y - 20),
+                    min(iw, x + w + 20),
+                    min(ih, y + h + 20),
+                ),
+                **grid,
+            }
+            if debug:
+                print(
+                    f"  ✅ [红色网格章] bbox={result['bbox']}, "
+                    f"{grid['rows']}行×{grid['cols']}列={grid['cells']}格"
+                )
+            return result
+
+        return None
 
     def get_stamp_crop(self, image_path:str) -> np.ndarray | None:
         """
@@ -120,7 +175,9 @@ class StampTableCheck:
         aspect = w / h if h > 0 else 0
 
         # 宽高比过滤
-        if not (1.3 < aspect < 10):
+        # 归档章通常是紧凑的多列表格；红头标题往往是一条很宽的红色
+        # 文字带。限制最大宽高比可避免把红头字体连接块识别为归档章。
+        if not (1.3 < aspect < 6):
             return False
 
         # 横跨全图宽度 → 文档外框/下划线
@@ -248,7 +305,10 @@ class StampTableCheck:
 
     def _detect_struct_stamp(self, img: np.ndarray, debug=False) -> dict | None:
         ih, iw = img.shape[:2]
-        search_h = int(ih * 0.40)  # 只搜索上40%
+        # PartsDetector 会先截取页面顶部约 500px。对于这种矮图，如果仍只
+        # 搜索前 40%，归档章下半部分会被排除；矮图放宽到前 90%，完整页
+        # 仍限制在前 40%，避免扩大正文表格的误检范围。
+        search_h = int(ih * (0.90 if ih <= 1000 else 0.40))
         bw = int(iw * 0.35)
         bh = int(search_h * 0.70)
         stride_x = int(iw * 0.20)
@@ -350,6 +410,13 @@ class StampTableCheck:
         bh = ly2 - ly1
 
         # 误检过滤
+        # 单个汉字的横竖笔画也可能形成若干交点，但相对于整页通常很小。
+        # 归档章应达到一定的页面占比，避免将红头文字中的单字识别为小表格。
+        min_stamp_w = max(80, int(iw * 0.06))
+        min_stamp_h = max(35, int(ih * 0.08))
+        if bw < min_stamp_w or bh < min_stamp_h:
+            return None
+
         full_img_w = sx2 - sx1
         full_img_h = sy2 - sy1
         if bw > full_img_w * 0.95:  # 横跨全图
@@ -363,6 +430,12 @@ class StampTableCheck:
         gy1 = max(0, sy1 + ly1 - pad)
         gx2 = min(iw, sx1 + lx2 + pad)
         gy2 = min(ih, sy1 + ly2 + pad)
+
+        # 归档章应是页面内部的独立小表格。贴住页面左右边界的候选通常
+        # 是正文大表格被滑动窗口截出的局部，不应作为分件起始章。
+        edge_margin = max(5, int(iw * 0.01))
+        if gx1 <= edge_margin or gx2 >= iw - edge_margin:
+            return None
 
         # 格子计数
         stamp_crop = img[gy1:gy2, gx1:gx2]
@@ -495,4 +568,3 @@ if __name__ == "__main__":
         status = "有归档章" if r['found'] else "无归档章"
         cells = f"{r['rows']} 行 x {r['cols']} 列 = {r['cells']}格" if r['cells'] > 0 else "格子数未知"
         print(f"检测结果: {status} {cells}, 耗时: {elapsed}")
-

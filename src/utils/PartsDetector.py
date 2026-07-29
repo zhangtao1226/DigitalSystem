@@ -7,6 +7,7 @@
 import os
 import time
 import shutil
+import uuid
 from queue import Queue
 
 import cv2
@@ -37,15 +38,23 @@ class PartsDetector:
     def _get_dir_images(self):
         try:
             with os.scandir(self.dir_path) as entries:
-                for entry in entries:
-                    if entry.is_file(follow_symlinks=False):
-                        self.images_queue.put(os.path.basename(entry.path))
+                image_names = sorted(
+                    os.path.basename(entry.path)
+                    for entry in entries
+                    if (
+                        entry.is_file(follow_symlinks=False)
+                        and Path(entry.name).suffix.lower()
+                        in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+                    )
+                )
+            for image_name in image_names:
+                self.images_queue.put(image_name)
 
         except FileNotFoundError as e:
             logger.warning(f"当前文件夹未检测到扫描文件, 分件失败; 当前文件夹路径: {self.dir_path}; {str(e)}")
 
 
-    def catalog(self, catalog_path:str) -> Result:
+    def catalog(self, catalog_path:str, progress_callback=None) -> Result:
         """
         目录分件
         """
@@ -67,11 +76,20 @@ class PartsDetector:
             return Result.fail(message="导入目录页数与扫描件数不匹配")
 
         try:
+            processed = 0
+            if progress_callback:
+                progress_callback(0, files_count, "正在准备目录分件...")
             for index, series in catalog_list.iterrows():
                 target_path = f"{self.dir_path}/{series.iloc[1]}"
                 if not os.path.exists(target_path):
                     os.makedirs(target_path, exist_ok=True)
-                self.move_images(target_path, series.iloc[7])
+                processed = self.move_images(
+                    target_path,
+                    series.iloc[7],
+                    progress_callback,
+                    processed,
+                    files_count,
+                )
             return Result.success(code=1, message="分件成功")
         except PermissionError as e:
             logger.warning(f"没有权限访问图片; {str(e)}")
@@ -80,7 +98,14 @@ class PartsDetector:
             logger.warning(f"图片移动失败; {str(e)} ")
             return Result.fail(message="分件失败")
 
-    def move_images(self, images_target_path:str, move_count:int):
+    def move_images(
+        self,
+        images_target_path:str,
+        move_count:int,
+        progress_callback=None,
+        processed=0,
+        total=None,
+    ):
         print(f"move_count: {move_count}")
 
         for i in range(move_count):
@@ -90,6 +115,14 @@ class PartsDetector:
             target_path = os.path.join(images_target_path, image_name)
             print(f"image_path:{image_path}", f"target_path: {target_path}", sep='/')
             shutil.move(image_path, target_path)
+            processed += 1
+            if progress_callback:
+                progress_callback(
+                    processed,
+                    total or processed,
+                    f"正在分件 {processed}/{total or processed}: {image_name}",
+                )
+        return processed
 
 
     def get_dir_files_count(self):
@@ -102,7 +135,7 @@ class PartsDetector:
                 pass
         return dir_count
 
-    def stamp_parts(self, stamp_model):
+    def stamp_parts(self, stamp_model, progress_callback=None):
         """
         归档章分件
         """
@@ -113,12 +146,22 @@ class PartsDetector:
 
         serial_number = 0
         current_folder = None
+        total = self.images_queue.qsize()
+        processed = 0
+        if progress_callback:
+            progress_callback(0, total, "正在准备归档章分件...")
         while not self.images_queue.empty():
             image_path = self.images_queue.get()
             print(f"image_path: {image_path}")
-            output_image = self.cut_image(image_path, area=1)
-
-            stamp_result = stamp_check.has_stamp(output_image)
+            image_process = ImageProcessor(
+                os.path.join(self.dir_path, image_path)
+            )
+            image_process.extract_top(500)
+            crop_rgb = np.asarray(
+                image_process.image.convert("RGB")
+            )
+            crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+            stamp_result = stamp_check.has_stamp(crop_bgr)
 
             if stamp_result:
                 serial_number += 1
@@ -133,6 +176,13 @@ class PartsDetector:
             origin_image_path = f"{self.dir_path}/{image_path}"
             target_image_path = f"{current_folder}/{image_path}"
             shutil.move(origin_image_path, target_image_path)
+            processed += 1
+            if progress_callback:
+                progress_callback(
+                    processed,
+                    total,
+                    f"正在检测并分件 {processed}/{total}: {image_path}",
+                )
 
             # os.remove(output_image)
 
@@ -141,7 +191,12 @@ class PartsDetector:
     def cut_image(self, image:str, area:int):
         image_process = ImageProcessor(f"{self.dir_path}/{image}")
 
-        output_file_top = f"{settings.temp_path}/parts_temp_{image.split('.')[0][-4:]}_{int(time.time())}.jpg"
+        image_stem = Path(image).stem
+        unique_id = f"{time.time_ns()}_{uuid.uuid4().hex}"
+        output_file_top = os.path.join(
+            settings.temp_path,
+            f"parts_temp_{image_stem}_{unique_id}.jpg",
+        )
         if area == 1:
             image_process.extract_top(500).save(output_file_top)
         else:
@@ -189,12 +244,3 @@ class PartsDetector:
 
         logger.info("未检测到归档章!")
         return False
-
-if __name__ == "__main__":
-    dir_path = r"D:\ZT_Projects\scna_test\001\0008-WS-2025·Y·BGS"
-    parts_detector = PartsDetector(dir_path=dir_path)
-
-    images = parts_detector.stamp_parts(dir_path)
-    for image in images:
-        print(image, sep='/')
-
