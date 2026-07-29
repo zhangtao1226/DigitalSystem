@@ -201,21 +201,10 @@ class StatisticsTableWindow(FramelessWindow):
         start_date = self._qdate_to_datetime(self.start_date_edit.date())
         end_date = self._qdate_to_datetime(self.end_date_edit.date())
 
-        if period == "日":
+        if period in ("日", "周", "月"):
             range_start = start_date
-            range_end = range_start + timedelta(days=1)
-            range_label = range_start.strftime("%Y-%m-%d")
-        elif period == "周":
-            range_start = start_date - timedelta(days=start_date.weekday())
-            range_end = range_start + timedelta(days=7)
-            range_label = f"{range_start.strftime('%Y-%m-%d')} 至 {(range_end - timedelta(days=1)).strftime('%Y-%m-%d')}"
-        elif period == "月":
-            range_start = start_date.replace(day=1)
-            if range_start.month == 12:
-                range_end = range_start.replace(year=range_start.year + 1, month=1)
-            else:
-                range_end = range_start.replace(month=range_start.month + 1)
-            range_label = range_start.strftime("%Y-%m")
+            range_end = end_date + timedelta(days=1)
+            range_label = f"{range_start.strftime('%Y-%m-%d')} 至 {end_date.strftime('%Y-%m-%d')}"
         else:
             if end_date < start_date:
                 show_warning(self, "日期范围错误", "结束日期不能早于开始日期")
@@ -237,7 +226,7 @@ class StatisticsTableWindow(FramelessWindow):
             self.end_date_edit.setEnabled(True)
             return
 
-        self.start_date_label.setText("日期:" if period == "日" else "参考日期:")
+        self.start_date_label.setText("开始日期:")
         self.end_date_label.setVisible(True)
         self.end_date_edit.setVisible(True)
         self.end_date_edit.setEnabled(False)
@@ -245,19 +234,32 @@ class StatisticsTableWindow(FramelessWindow):
         if period == "日":
             display_end = start_date
         elif period == "周":
-            display_end = start_date - timedelta(days=start_date.weekday()) + timedelta(days=6)
+            display_end = start_date + timedelta(days=7)
         else:
-            month_start = start_date.replace(day=1)
-            if month_start.month == 12:
-                next_month = month_start.replace(year=month_start.year + 1, month=1)
-            else:
-                next_month = month_start.replace(month=month_start.month + 1)
-            display_end = next_month - timedelta(days=1)
+            display_end = self._qdate_to_datetime(
+                self.start_date_edit.date().addMonths(1)
+            )
 
         self._set_end_date(display_end)
 
     def on_period_changed(self, text):
+        use_today_as_end = (
+            self.sender() is self.period_combo and text in ("日", "周", "月")
+        )
+        if use_today_as_end:
+            today = QDate.currentDate()
+            self.start_date_edit.blockSignals(True)
+            if text == "日":
+                start_date = today
+            elif text == "周":
+                start_date = today.addDays(-7)
+            else:
+                start_date = today.addMonths(-1)
+            self.start_date_edit.setDate(start_date)
+            self.start_date_edit.blockSignals(False)
         self._sync_period_date_display()
+        if use_today_as_end:
+            self._set_end_date(self._qdate_to_datetime(today))
 
     def on_start_date_changed(self, date):
         self._sync_period_date_display()
